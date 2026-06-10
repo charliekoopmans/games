@@ -138,7 +138,13 @@ let banner = null;          // { text, color, t }
 // in WebAudio so the file stays self-contained. Both honour `muted`.
 let actx = null;
 let heartPulse = 0;          // spikes on every heartbeat; drives the red vignette
-const music = { started: false, master: null, vol: 0.55, tense: false, noise: null };
+const music = { started: false, master: null, vol: 0.6, tense: false, noise: null };
+
+// Loss "jumpscare" state machine. On a loss the whole score cuts to silence and
+// the screen fades to black; after an unpredictable wait something lunges out.
+// state: "off" | "quiet" (dread build) | "active" (the scare is on screen).
+const jump = { state: "off", t: 0, wait: 0 };
+function scoreSilent() { return muted || jump.state !== "off"; }
 
 function ensureCtx() {
   if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
@@ -164,7 +170,6 @@ function winSound() {
   // an uneasy "victory" — a minor-key arpeggio that doesn't quite resolve
   [392, 466, 587, 740].forEach((f, i) => setTimeout(() => sfx(f, 0.3, "triangle", 0.2), i * 120));
 }
-function loseSound() { dread(); }
 
 // --- Generative horror score -----------------------------------------------
 function makeNoiseBuffer() {
@@ -192,6 +197,8 @@ function startMusic() {
   scheduleHeartbeat();
   scheduleStinger();
   scheduleWhisper();
+  scheduleBells();
+  scheduleGroan();
 }
 
 // Low dissonant cluster (root + minor 2nd + tritone + fifth) — deeply unsettled.
@@ -204,17 +211,70 @@ function buildDrone() {
   const fLfoG = actx.createGain(); fLfoG.gain.value = 180;
   fLfo.connect(fLfoG); fLfoG.connect(filt.frequency); fLfo.start();
 
-  [55.0, 58.27, 77.78, 82.41].forEach((f, i) => {
+  // 27.5 = sub A0 (a black, body-felt floor) up through a minor-2nd/tritone cluster.
+  [27.5, 55.0, 58.27, 77.78, 82.41].forEach((f, i) => {
     const o = actx.createOscillator();
-    o.type = i % 2 ? "triangle" : "sine";
+    o.type = i === 0 ? "sine" : (i % 2 ? "sawtooth" : "triangle"); // saw = harsher, grittier
     o.frequency.value = f;
-    o.detune.value = (i - 1.5) * 6;                 // micro-detune = beating, queasy
-    const g = actx.createGain(); g.gain.value = 0.1;
+    o.detune.value = (i - 2) * 7;                    // micro-detune = beating, queasy
+    const g = actx.createGain(); g.gain.value = i === 0 ? 0.16 : 0.09;
     const lfo = actx.createOscillator(); lfo.frequency.value = 0.04 + i * 0.013;
     const lfoG = actx.createGain(); lfoG.gain.value = 0.05;
     lfo.connect(lfoG); lfoG.connect(g.gain); lfo.start();
     o.connect(g); g.connect(filt); o.start();
   });
+
+  // A faint, ever-present high "tinnitus" ring — the sound of held breath.
+  const ring = actx.createOscillator(); ring.type = "sine"; ring.frequency.value = 5200;
+  const rg = actx.createGain(); rg.gain.value = 0.006;
+  ring.connect(rg); rg.connect(music.master); ring.start();
+}
+
+// A broken music-box: sparse, detuned bell notes from a creepy scale, with long
+// decay. Nothing is more unsettling than a lullaby that's slightly wrong.
+const BELL_SCALE = [415.30, 440.00, 466.16, 554.37, 622.25, 739.99]; // Ab-ish dissonant set
+function bell(t, f) {
+  for (const mul of [1, 2.01, 2.99]) {               // inharmonic partials = "wrong" bell
+    const o = actx.createOscillator(); o.type = "triangle";
+    o.frequency.value = f * mul; o.detune.value = (Math.random() - 0.5) * 25;
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.09 / mul, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 2.6 + Math.random());
+    o.connect(g); g.connect(music.master);
+    o.start(t); o.stop(t + 4);
+  }
+}
+function scheduleBells() {
+  if (!music.started) return;
+  if (!scoreSilent() && Math.random() < 0.8) {
+    const n = 1 + (Math.random() < 0.3 ? 1 : 0);     // usually one note, sometimes two
+    for (let i = 0; i < n; i++) {
+      bell(actx.currentTime + 0.05 + i * 0.28, BELL_SCALE[Math.floor(Math.random() * BELL_SCALE.length)]);
+    }
+  }
+  setTimeout(scheduleBells, (4 + Math.random() * 7) * 1000);
+}
+
+// A low, wet groan that swells from the dark — like something large turning over.
+function groan(t) {
+  const o = actx.createOscillator(); o.type = "sawtooth";
+  const base = 70 + Math.random() * 40;
+  o.frequency.setValueAtTime(base, t);
+  o.frequency.linearRampToValueAtTime(base * 1.5, t + 1.0);
+  o.frequency.linearRampToValueAtTime(base * 0.8, t + 2.4);
+  const lp = actx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 300; lp.Q.value = 6;
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(0.14, t + 0.8);
+  g.gain.linearRampToValueAtTime(0.0001, t + 2.6);
+  o.connect(lp); lp.connect(g); g.connect(music.master);
+  o.start(t); o.stop(t + 2.7);
+}
+function scheduleGroan() {
+  if (!music.started) return;
+  if (!scoreSilent() && Math.random() < 0.7) groan(actx.currentTime + 0.05);
+  setTimeout(scheduleGroan, (11 + Math.random() * 14) * 1000);
 }
 
 // Sub-bass rumble bed from filtered noise — felt more than heard.
@@ -242,19 +302,20 @@ function thump(t, f, vol) {
 }
 function scheduleHeartbeat() {
   if (!music.started) return;
-  const t = actx.currentTime + 0.04;
-  thump(t, 58, 0.55);
-  thump(t + 0.19, 48, 0.42);
-  heartPulse = 1;                                   // tells the renderer to throb
-  let interval = music.tense ? 0.78 : 1.65;
-  if (gameOver && winner === MITE && vsCpu) interval = 0.5; // racing dread on a loss
+  if (jump.state === "off") {                       // during the loss sequence: dead still
+    const t = actx.currentTime + 0.04;
+    thump(t, 58, 0.55);
+    thump(t + 0.19, 48, 0.42);
+    heartPulse = 1;                                 // tells the renderer to throb
+  }
+  let interval = music.tense ? 0.7 : 1.6;
   if (gameOver && winner === SPORE) interval = 2.4;          // slow exhale on a win
   setTimeout(scheduleHeartbeat, interval * 1000);
 }
 
 // A bowed, detuned violin-ish screech that swells and dies — sparse and sudden.
 function screech(t, vol = 0.07) {
-  if (!music.started || muted) return;
+  if (!music.started || scoreSilent()) return;
   const o = actx.createOscillator(); o.type = "sawtooth";
   const base = 520 + Math.random() * 900;
   o.frequency.setValueAtTime(base, t);
@@ -272,8 +333,9 @@ function screech(t, vol = 0.07) {
 }
 function scheduleStinger() {
   if (!music.started) return;
-  if (!muted && Math.random() < 0.85) screech(actx.currentTime + 0.05);
-  setTimeout(scheduleStinger, (6 + Math.random() * 12) * 1000);
+  if (!scoreSilent() && Math.random() < 0.9) screech(actx.currentTime + 0.05, music.tense ? 0.1 : 0.07);
+  const gap = music.tense ? (3 + Math.random() * 5) : (5 + Math.random() * 9); // closer when tense
+  setTimeout(scheduleStinger, gap * 1000);
 }
 
 // Filtered-noise "whisper" that sweeps up and fades — like something breathing close by.
@@ -291,32 +353,63 @@ function whisper(t) {
 }
 function scheduleWhisper() {
   if (!music.started) return;
-  if (!muted) whisper(actx.currentTime + 0.05);
+  if (!scoreSilent()) whisper(actx.currentTime + 0.05);
   setTimeout(scheduleWhisper, (9 + Math.random() * 12) * 1000);
 }
 
-// A descending detuned cluster swell for defeat — the floor dropping out.
-function dread() {
-  if (!actx) return;
+// Begin the loss sequence: kill the score to silence, then arm the jumpscare.
+function triggerLoss() {
+  if (music.master && actx) {
+    music.master.gain.cancelScheduledValues(actx.currentTime);
+    music.master.gain.linearRampToValueAtTime(0.0001, actx.currentTime + 0.5); // everything goes quiet
+  }
+  jump.state = "quiet";
+  jump.t = 0;
+  jump.wait = 200 + Math.floor(Math.random() * 260);  // ~3.3–7.7s of dread before it hits
+}
+
+// The jumpscare itself: a sudden, brutal wall of sound (sub-boom + noise blast +
+// dissonant screech cluster) routed straight to the output, bypassing the muted
+// score bus. Paired with the on-screen lunge in drawJumpscare().
+function jumpscareSound() {
+  if (muted) return;
+  ensureCtx();
   const t = actx.currentTime;
-  [220, 233, 311].forEach((f) => {
+  const out = actx.createGain(); out.gain.value = 0.9; out.connect(actx.destination);
+
+  // sub boom dropping through the floor
+  const bo = actx.createOscillator(), bg = actx.createGain();
+  bo.type = "sine"; bo.frequency.setValueAtTime(140, t); bo.frequency.exponentialRampToValueAtTime(26, t + 0.9);
+  bg.gain.setValueAtTime(0.7, t); bg.gain.exponentialRampToValueAtTime(0.0001, t + 1.4);
+  bo.connect(bg); bg.connect(out); bo.start(t); bo.stop(t + 1.5);
+
+  // explosive noise burst
+  const ns = actx.createBufferSource(); ns.buffer = music.noise || makeNoiseBuffer(); ns.loop = true;
+  const nf = actx.createBiquadFilter(); nf.type = "highpass"; nf.frequency.value = 500;
+  const ng = actx.createGain(); ng.gain.setValueAtTime(0.6, t); ng.gain.exponentialRampToValueAtTime(0.0001, t + 1.0);
+  ns.connect(nf); nf.connect(ng); ng.connect(out); ns.start(t); ns.stop(t + 1.1);
+
+  // shrieking detuned cluster
+  [311, 349, 466, 587, 740, 988].forEach((f) => {
     const o = actx.createOscillator(); o.type = "sawtooth";
-    o.frequency.setValueAtTime(f, t);
-    o.frequency.exponentialRampToValueAtTime(f * 0.35, t + 1.8);
+    o.frequency.setValueAtTime(f * 2, t);
+    o.frequency.linearRampToValueAtTime(f * 2 * 1.03, t + 1.1);
+    o.detune.value = (Math.random() - 0.5) * 30;
     const g = actx.createGain();
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(muted ? 0.0001 : 0.18, t + 0.3);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 2.2);
-    o.connect(g); g.connect(actx.destination);
-    o.start(t); o.stop(t + 2.3);
+    g.gain.linearRampToValueAtTime(0.14, t + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.3);
+    o.connect(g); g.connect(out); o.start(t); o.stop(t + 1.35);
   });
 }
 
 // Resume/raise or duck the score when mute toggles.
 function applyMute() {
   if (music.master && actx) {
+    // stay silent while the loss sequence is running, even if un-muted
+    const target = (muted || jump.state !== "off") ? 0.0001 : music.vol;
     music.master.gain.cancelScheduledValues(actx.currentTime);
-    music.master.gain.linearRampToValueAtTime(muted ? 0.0001 : music.vol, actx.currentTime + 0.4);
+    music.master.gain.linearRampToValueAtTime(target, actx.currentTime + 0.4);
   }
 }
 
@@ -393,8 +486,9 @@ function endGame(who, line) {
   shake = 20;
   if (who === SPORE) { banner = { text: "SPORES WIN", color: COLORS[SPORE].core, t: 240 }; winSound(); }
   else if (who === MITE) {
-    banner = { text: vsCpu ? "INFESTED" : "MITES WIN", color: COLORS[MITE].core, t: 240 };
-    vsCpu ? loseSound() : winSound();
+    // The dreaded outcome: cut to silence and arm the jumpscare (see triggerLoss).
+    banner = { text: vsCpu ? "INFESTED" : "MITES WIN", color: COLORS[MITE].core, t: 120 };
+    triggerLoss();
   } else { banner = { text: "CLOGGED — DRAW", color: "#9a8a6a", t: 240 }; }
   for (const h of line) spawnBurst(h.x, h.y, COLORS[who].core, 26);
 }
@@ -577,6 +671,11 @@ function reset() {
   turn = SPORE; gameOver = false; winner = 0; winLine = [];
   particles = []; shake = 0; movesSincePlace = 0; banner = null;
   cpuThinkAt = 0;
+  jump.state = "off"; jump.t = 0;                    // disarm any pending jumpscare
+  if (music.started && actx) {                       // bring the score back from silence
+    music.master.gain.cancelScheduledValues(actx.currentTime);
+    music.master.gain.linearRampToValueAtTime(muted ? 0.0001 : music.vol, actx.currentTime + 1.5);
+  }
 }
 
 // --- Particles & ambient bugs ----------------------------------------------
@@ -711,6 +810,19 @@ function draw() {
   drawVignette();
   drawHud();
 
+  // --- loss sequence: silence → creeping dark → sudden lunge ----------------
+  if (jump.state === "quiet") {
+    jump.t++;
+    drawQuiet(Math.min(1, jump.t / jump.wait));
+    if (jump.t >= jump.wait) {                 // the wait is over...
+      jump.state = "active"; jump.t = 0; shake = 46;
+      jumpscareSound();
+      if (navigator.vibrate) navigator.vibrate([220, 60, 320]);
+    }
+  } else if (jump.state === "active") {
+    drawJumpscare(++jump.t);
+  }
+
   // the heartbeat quickens as the cluster fills in (and on a loss — see scheduler)
   music.tense = !gameOver && emptyHoles().length < holes.length * 0.45;
 
@@ -735,6 +847,89 @@ function drawVignette() {
   g.addColorStop(1, `rgba(80,0,5,${a})`);
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, W, H);
+}
+
+// The quiet: the whole screen slowly drowns in black while two faint red eyes
+// you can't quite trust begin to surface. Then nothing — for an uneasy while.
+function drawQuiet(p) {
+  ctx.fillStyle = `rgba(0,0,0,${Math.pow(p, 1.5) * 0.94})`;
+  ctx.fillRect(0, 0, W, H);
+  if (p > 0.5) {
+    const a = (p - 0.5) * 2 * 0.13 * (0.55 + 0.45 * Math.sin(frame * 0.07));
+    ctx.fillStyle = `rgba(150,0,0,${a})`;
+    for (const dx of [-42, 42]) {
+      ctx.beginPath(); ctx.arc(W / 2 + dx, ORIGIN_Y, 6.5, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+// The lunge: a screaming, hole-riddled face snaps to full screen and shudders.
+function drawJumpscare(t) {
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+  const inten = Math.max(0, 1 - (t - 4) / 80);      // violence of the lunge, decays
+  ctx.save();
+  const jit = inten * 22;
+  ctx.translate((Math.random() - 0.5) * jit, (Math.random() - 0.5) * jit);
+  const cx = W / 2, cy = H * 0.46;
+  const sc = 1.02 + Math.max(0, 0.14 - t * 0.004) + Math.sin(t * 0.4) * 0.01 * inten;
+  ctx.translate(cx, cy); ctx.scale(sc, sc); ctx.translate(-cx, -cy);
+  drawFace(cx, cy, inten);
+  ctx.restore();
+  if (inten > 0) { ctx.fillStyle = `rgba(130,0,0,${inten * 0.38})`; ctx.fillRect(0, 0, W, H); }
+  if (t < 5) { ctx.fillStyle = `rgba(255,255,255,${(5 - t) / 5 * 0.92})`; ctx.fillRect(0, 0, W, H); } // impact flash
+  if (t > 90) {                                     // once it settles, offer the way out
+    ctx.textAlign = "center";
+    ctx.fillStyle = `rgba(180,160,150,${0.3 + 0.2 * Math.sin(t * 0.06)})`;
+    ctx.font = "13px 'Courier New', monospace";
+    ctx.fillText("click to escape", W / 2, H - 24);
+  }
+}
+
+// A gaunt face pocked with clustered holes (of course), hollow eyes, screaming mouth.
+function drawFace(cx, cy, inten) {
+  const fw = W * 0.46, fh = H * 0.5;
+  let g = ctx.createRadialGradient(cx, cy - 30, 20, cx, cy, fh);
+  g.addColorStop(0, "#bdb49d"); g.addColorStop(0.7, "#857f68"); g.addColorStop(1, "#100d08");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.ellipse(cx, cy, fw, fh, 0, 0, Math.PI * 2); ctx.fill();
+
+  // clustered holes across the skin — fixed positions (golden-angle spiral) so they don't flicker
+  ctx.fillStyle = "rgba(8,5,3,0.85)";
+  for (let i = 0; i < 95; i++) {
+    const a = i * 2.39996, rad = Math.sqrt(i / 95) * fw * 0.95;
+    const x = cx + Math.cos(a) * rad, y = cy + Math.sin(a) * rad * 1.05;
+    ctx.beginPath(); ctx.arc(x, y, 3 + (i % 5 === 0 ? 2 : 0), 0, Math.PI * 2); ctx.fill();
+  }
+
+  // hollow eye sockets with a glowing, twitching red pupil
+  for (const dx of [-fw * 0.4, fw * 0.4]) {
+    const ex = cx + dx, ey = cy - fh * 0.18;
+    let eg = ctx.createRadialGradient(ex, ey, 2, ex, ey, fw * 0.3);
+    eg.addColorStop(0, "#000"); eg.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = eg;
+    ctx.beginPath(); ctx.ellipse(ex, ey, fw * 0.27, fh * 0.2, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = `rgba(255,30,18,${0.7 + 0.3 * inten})`;
+    const pj = inten * (Math.random() - 0.5) * 6;
+    ctx.beginPath(); ctx.arc(ex + pj, ey, 7 + inten * 3, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // gaping, screaming mouth ringed with jagged teeth
+  const my = cy + fh * 0.42;
+  let mg = ctx.createRadialGradient(cx, my, 4, cx, my, fw * 0.4);
+  mg.addColorStop(0, "#2a0000"); mg.addColorStop(0.6, "#070000"); mg.addColorStop(1, "#000");
+  ctx.fillStyle = mg;
+  ctx.beginPath(); ctx.ellipse(cx, my, fw * 0.26, fh * 0.24, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#9a9482";
+  const tw = (fw * 0.5) / 8;
+  for (let i = 0; i < 8; i++) {
+    const tx = cx - fw * 0.24 + i * tw + tw / 2;
+    ctx.beginPath();
+    ctx.moveTo(tx - tw * 0.4, my - fh * 0.22); ctx.lineTo(tx + tw * 0.4, my - fh * 0.22);
+    ctx.lineTo(tx, my - fh * 0.12); ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(tx - tw * 0.4, my + fh * 0.22); ctx.lineTo(tx + tw * 0.4, my + fh * 0.22);
+    ctx.lineTo(tx, my + fh * 0.12); ctx.closePath(); ctx.fill();
+  }
 }
 
 function drawHud() {
