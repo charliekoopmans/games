@@ -1,0 +1,1360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pong</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-family: "Courier New", monospace;
+    color: #fff;
+    user-select: none;
+  }
+  canvas {
+    background: #000;
+    border: 2px solid #fff;
+    touch-action: none;
+  }
+  #hint {
+    margin-top: 12px;
+    font-size: 14px;
+    color: #888;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <canvas id="game" width="800" height="500"></canvas>
+  <div id="hint">
+    Player (left): <b>W</b>/<b>S</b> or <b>↑</b>/<b>↓</b> &nbsp;•&nbsp; <b>Space</b> start / pause
+    &nbsp;•&nbsp; First to 11 wins<br>
+    Difficulty <b>1</b> Easy &nbsp;<b>2</b> Medium &nbsp;<b>3</b> Hard
+    &nbsp;<b>4</b> Versus (Pro) &nbsp;•&nbsp; <b>F</b> Normal/Fast speed
+    &nbsp;•&nbsp; <b>M</b> mute &nbsp;•&nbsp; 🛸 ricochets!<br>
+    Abilities: <b>Q</b> cycle &nbsp;<b>E</b> activate &nbsp;—&nbsp;
+    Grow · Slow-Mo · Smash · Shield · Blink · Haste · Freeze · Curve (CPU uses them too!)<br>
+    Hit the floating power-ups: 🔥 Fireball · 💎 Double points · ✂️ Shrink rival
+  </div>
+
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+const WIN_SCORE = 11;
+const PADDLE_W = 12, PADDLE_H = 80, PADDLE_SPEED = 6;
+const BALL_SIZE = 12, BALL_SPEED = 5;
+
+const player = { x: 20, y: H / 2 - PADDLE_H / 2, h: PADDLE_H, score: 0 };
+const cpu = { x: W - 20 - PADDLE_W, y: H / 2 - PADDLE_H / 2, h: PADDLE_H, score: 0 };
+const ball = { x: 0, y: 0, vx: 0, vy: 0, owner: null, fire: false, bonus: 1, curve: 0, trail: [] };
+
+// ---- Juice & power-up state ----
+let particles = [];           // short-lived spark effects
+let powerups = [];            // floating pickups the ball can collect
+let powerupTimer = 0;         // frames until the next pickup spawns
+let shake = 0;                // screen-shake magnitude (decays each frame)
+let stars = [];               // parallax starfield (filled on first run)
+let planets = [];             // slow-drifting background planets
+let nebulas = [];             // soft coloured nebula clouds
+const shootingStar = { active: false, timer: 90, x: 0, y: 0, vx: 0, vy: 0 };
+let flash = null;             // brief "FIREBALL!" style banner { text, color, t }
+const shrinkUntil = { player: 0, cpu: 0 }; // frame each paddle's shrink expires
+
+// Collectible pickups. Effects are credited to whoever last hit the ball.
+// fire  : ball accelerates and gains a fiery trail for the rest of the rally.
+// double: if the owner scores this rally, it counts for 2 points (golden ball).
+// shrink: the owner's OPPONENT has their paddle halved for a few seconds.
+const POWERUPS = [
+  { id: "fire",   name: "FIREBALL", color: "#ff7b3d", glyph: "🔥" },
+  { id: "double", name: "DOUBLE",   color: "#ffd34d", glyph: "💎" },
+  { id: "shrink", name: "SHRINK",   color: "#ff5d7c", glyph: "✂" },
+];
+const POWERUP_R = 16;
+
+// ---- Player abilities ----
+// Cycle the selected ability with Q, activate it with E. Each has a cooldown.
+// grow  : your paddle temporarily gets much taller.
+// slow  : the ball moves at half speed for a few seconds (easier returns).
+// smash : arms your NEXT hit to fire the ball back at high speed.
+// shield: a temporary energy wall appears in front of your goal.
+// grow/slow/shield/haste are timed; smash/curve arm the next hit; blink/freeze
+// fire instantly. The CPU can use all of them too (see updateCpuAbilities).
+const ABILITIES = [
+  { id: "grow",   name: "Grow Paddle",   dur: 300, cd: 600, color: "#7CFC8A" },
+  { id: "slow",   name: "Slow-Mo Ball",  dur: 240, cd: 600, color: "#7CC4FC" },
+  { id: "smash",  name: "Power Smash",   dur: 0,   cd: 420, color: "#FC7C7C" },
+  { id: "shield", name: "Energy Shield", dur: 180, cd: 720, color: "#E07CFC" },
+  { id: "blink",  name: "Blink Warp",    dur: 0,   cd: 360, color: "#FCE77C" },
+  { id: "haste",  name: "Haste",         dur: 300, cd: 600, color: "#7CFCEB" },
+  { id: "freeze", name: "Freeze Ray",    dur: 0,   cd: 660, color: "#9FD8FF" },
+  { id: "curve",  name: "Curveball",     dur: 0,   cd: 480, color: "#FFA86B" },
+];
+const HASTE_MUL = 1.8;        // paddle-speed boost while Haste is active
+// Player ability state (driven by Q/E).
+let abilityIdx = 0;
+let activeAbility = null;     // id of the player's currently-active timed ability
+let abilityEndsAt = 0;        // frame when the player's active ability expires
+let abilityReadyAt = 0;       // frame when the player can use an ability again
+let pendingSmash = false;     // armed Power Smash, consumed on next player hit
+
+let pendingCurve = false;     // armed Curveball, consumed on next player hit
+
+// CPU ability state (driven by the AI — see updateCpuAbilities).
+let cpuActiveAbility = null;
+let cpuAbilityEndsAt = 0;
+let cpuAbilityReadyAt = 0;
+let cpuPendingSmash = false;
+let cpuPendingCurve = false;
+let cpuThinkAt = 0;           // next frame the AI reconsiders using an ability
+
+// Freeze Ray: frame until which each paddle is frozen in place.
+const frozenUntil = { player: 0, cpu: 0 };
+
+let ballSpeedMul = 1;         // Slow-Mo multiplier applied to ball movement
+let frame = 0;                // advances only while the game is running
+let tick = 0;                 // advances every animation frame (for title anims)
+let scene = "title";          // "title" | "play"
+const SHIELD_X = 56;          // x of the player's (left) Energy Shield wall
+const SHIELD_X_R = W - SHIELD_X - 5; // x of the CPU's (right) Energy Shield wall
+
+// ---- Random spaceship obstacle ----
+// Spawns at a random spot in the central band, hovers/drifts for a while,
+// then vanishes and respawns elsewhere. The ball ricochets off it.
+const SHIP_W = 70, SHIP_H = 34;
+const ship = {
+  active: false,
+  x: 0, y: 0,
+  vy: 0,             // gentle vertical drift
+  timer: 0,          // frames until next state change
+  bob: 0,            // animation phase for the engine glow
+};
+
+let running = false;
+let gameOver = false;
+const keys = {};
+
+// CPU "imperfection": a target offset it drifts toward, refreshed periodically
+let cpuTarget = H / 2;
+let cpuRetargetIn = 0;
+
+// ---- Difficulty ----
+// speed   : CPU max step as a fraction of the player's paddle speed
+// reMin/Max: frames between re-aims (higher = slower reactions / more lag)
+// error   : vertical aim noise as a multiple of paddle height (higher = worse)
+// use     : how aggressively the CPU spends abilities (0–1 chance per decision)
+const DIFFICULTIES = {
+  easy:   { label: "Easy",   speed: 0.62, reMin: 16, reMax: 30, error: 1.5,  use: 0.18 },
+  medium: { label: "Medium", speed: 0.72, reMin: 12, reMax: 22, error: 1.1,  use: 0.4 },
+  hard:   { label: "Hard",   speed: 0.92, reMin: 6,  reMax: 12, error: 0.45, use: 0.65 },
+  pro:    { label: "Versus (Pro)", use: 0.85 }, // also uses the strategic AI (updateProCPU)
+};
+let difficulty = "medium";
+
+// ---- Game speed ----
+// A global multiplier on all motion (ball + both paddles). Normal is the
+// default; Fast mode quickens everything for a higher-intensity rally.
+const SPEED_MODES = {
+  normal: { label: "Normal", mul: 1 },
+  fast:   { label: "Fast",   mul: 1.6 },
+};
+let speedMode = "normal";
+let gameSpeed = SPEED_MODES[speedMode].mul;
+
+// ---- Pro/Versus AI state ----
+// A competitive opponent: predicts the ball's intercept (with wall bounces),
+// places returns away from you, and recovers to a ready position between shots.
+let cpuPrevBallDir = 0; // tracks when the ball turns toward the CPU
+let cpuReactAt = 0;     // frame the CPU has "read" the incoming shot
+let cpuAimError = 0;    // per-rally read error (usually small, sometimes a blunder)
+
+// ---- Sound on/off ----
+let muted = false;
+
+// ---- Sound effects + music (Web Audio, generated on the fly — no files) ----
+let audioCtx = null;
+let masterMusic = null;       // master music gain (mute control)
+let musicBus = null;          // melodic voices → low-pass → master
+let percBus = null;           // percussion → master (full range, crisp)
+const MUSIC_VOL = 0.5;
+// Sequencer state, scheduled a touch ahead of the audio clock. step is an
+// absolute counter (wrapped at a long period) so we can derive bar & section.
+const music = { track: null, step: 0, nextTime: 0, bpm: 100 };
+function beep(freq, duration = 0.07, type = "square", gain = 0.06) {
+  if (!audioCtx || muted) return;
+  const osc = audioCtx.createOscillator();
+  const env = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  env.gain.setValueAtTime(gain, audioCtx.currentTime);
+  env.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+  osc.connect(env).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+const sfx = {
+  paddle: () => beep(440, 0.06, "square"),
+  wall:   () => beep(220, 0.05, "square"),
+  score:  () => beep(160, 0.25, "sawtooth", 0.08),
+  win:    () => { beep(523, 0.12); setTimeout(() => beep(659, 0.12), 120);
+                  setTimeout(() => beep(784, 0.2), 240); },
+  ship:   () => beep(660, 0.09, "triangle", 0.07),
+  ability:() => { beep(523, 0.08, "sine", 0.07); setTimeout(() => beep(880, 0.1, "sine", 0.07), 70); },
+  shield: () => beep(990, 0.08, "sine", 0.07),
+  smash:  () => beep(120, 0.12, "sawtooth", 0.09),
+  curve:  () => beep(330, 0.12, "sine", 0.07),
+};
+function ensureAudio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+    if (audioCtx) {
+      // master(mute) ← [ musicBus → low-pass ]  and  ← [ percBus (crisp) ]
+      masterMusic = audioCtx.createGain();
+      masterMusic.gain.value = MUSIC_VOL;
+      masterMusic.connect(audioCtx.destination);
+      const lp = audioCtx.createBiquadFilter();
+      lp.type = "lowpass";
+      lp.frequency.value = 2600;
+      lp.connect(masterMusic);
+      musicBus = audioCtx.createGain();
+      musicBus.connect(lp);
+      percBus = audioCtx.createGain();
+      percBus.connect(masterMusic);
+    }
+  }
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+}
+
+// ---- Procedural music ----
+// Notes are MIDI numbers; chords are root-position triads in A-minor. An
+// 8-bar progression plus per-bar variation (arp direction, bass rhythm, when
+// the lead enters, drum fills) keeps it from sounding like a short loop.
+const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+// Progressions (one triad per bar). MIDI 57 = A3.
+const PROG_PLAY = [
+  [57, 60, 64], [53, 57, 60], [60, 64, 67], [55, 59, 62],  // Am  F  C  G
+  [57, 60, 64], [50, 53, 57], [52, 56, 59], [55, 59, 62],  // Am  Dm E  G
+];
+const PROG_MENU = [
+  [57, 60, 64], [52, 55, 59], [53, 57, 60], [60, 64, 67],  // Am  Em F  C
+  [55, 59, 62], [53, 57, 60], [52, 56, 59], [57, 60, 64],  // G   F  E  Am
+];
+// Bass rhythms (16 steps); rotated per bar so the groove keeps shifting.
+const BASS_RHYTHMS = [
+  [1,0,0,0, 1,0,1,0, 1,0,0,0, 1,0,1,0],
+  [1,0,1,0, 1,0,0,1, 1,0,1,0, 1,0,0,0],
+  [1,0,0,1, 1,0,1,0, 1,0,0,1, 1,0,1,0],
+];
+// Two lead phrases (semitone offsets from the chord root; null = rest),
+// alternated each 8-bar cycle for variety.
+const LEAD_A = [0,null,null,3, null,5,null,null, 7,null,5,null, 3,null,null,null];
+const LEAD_B = [7,null,5,null, 3,null,null,0, null,3,null,5, 7,null,null,null];
+const MUSIC_PERIOD = 16 * 48; // wrap step counter on a long, clean boundary
+
+function playTone(midi, time, dur, type, vol) {
+  if (!musicBus) return;
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(mtof(midi), time);
+  g.gain.setValueAtTime(0.0001, time);
+  g.gain.linearRampToValueAtTime(vol, time + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+  osc.connect(g).connect(musicBus);
+  osc.start(time);
+  osc.stop(time + dur + 0.05);
+}
+
+let _noiseBuf = null;
+function noiseBuffer() {
+  if (!_noiseBuf) {
+    const n = Math.floor(audioCtx.sampleRate * 0.3);
+    _noiseBuf = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+    const d = _noiseBuf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  }
+  return _noiseBuf;
+}
+function playKick(time) {
+  if (!percBus) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.frequency.setValueAtTime(150, time);
+  o.frequency.exponentialRampToValueAtTime(45, time + 0.13);
+  g.gain.setValueAtTime(0.0001, time);
+  g.gain.linearRampToValueAtTime(0.45, time + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + 0.18);
+  o.connect(g).connect(percBus);
+  o.start(time); o.stop(time + 0.2);
+}
+function playNoiseHit(time, dur, vol, hp) {
+  if (!percBus) return;
+  const src = audioCtx.createBufferSource(); src.buffer = noiseBuffer();
+  const f = audioCtx.createBiquadFilter(); f.type = "highpass"; f.frequency.value = hp;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+  src.connect(f).connect(g).connect(percBus);
+  src.start(time); src.stop(time + dur + 0.02);
+}
+const playHat = (t, v) => playNoiseHit(t, 0.04, v, 7000);
+const playSnare = (t) => { playNoiseHit(t, 0.16, 0.18, 1800); playKickless(t); };
+function playKickless(time) { // snare body tone
+  if (!percBus) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = "triangle"; o.frequency.setValueAtTime(190, time);
+  g.gain.setValueAtTime(0.12, time);
+  g.gain.exponentialRampToValueAtTime(0.0001, time + 0.1);
+  o.connect(g).connect(percBus);
+  o.start(time); o.stop(time + 0.12);
+}
+
+function startMusic(track) {
+  if (!audioCtx) return;
+  music.track = track;
+  music.step = 0;
+  music.bpm = track === "menu" ? 80 : 124;
+  music.nextTime = audioCtx.currentTime + 0.08;
+}
+
+// Switch tracks / kick the audio context awake on a user gesture.
+function kickAudio() {
+  ensureAudio();
+  const want = scene === "play" ? "play" : "menu";
+  if (music.track !== want) startMusic(want);
+}
+
+// Called every animation frame: schedule any steps due in the next ~120ms.
+function scheduleMusic() {
+  if (!audioCtx || !music.track) return;
+  const stepDur = 60 / music.bpm / 4; // sixteenth note
+  while (music.nextTime < audioCtx.currentTime + 0.12) {
+    if (!muted) playStep(music.track, music.step, music.nextTime, stepDur);
+    music.step = (music.step + 1) % MUSIC_PERIOD;
+    music.nextTime += stepDur;
+  }
+}
+
+function playStep(track, step, t, stepDur) {
+  const s = step % 16;                     // step within the bar
+  const bar = Math.floor(step / 16);
+  const prog = track === "menu" ? PROG_MENU : PROG_PLAY;
+  const chord = prog[bar % prog.length];
+  const root = chord[0];
+
+  if (track === "menu") {
+    // Evolving chord pad (changes every bar) + low root.
+    if (s === 0) {
+      for (const n of chord) playTone(n, t, stepDur * 16 * 1.05, "sine", 0.07);
+      playTone(root - 12, t, stepDur * 16 * 1.05, "sine", 0.09);
+    }
+    // Sparse bell melody from chord tones, position shifts each bar.
+    if (s === 0 || s === 6 || s === 10) {
+      const choices = [root + 12, chord[1] + 12, chord[2] + 12, root + 19];
+      playTone(choices[(bar * 3 + s) % choices.length], t, stepDur * 4, "triangle", 0.07);
+    }
+    if (s === 12 && bar % 2 === 1) playTone(root + 24, t, stepDur * 6, "sine", 0.04);
+    return;
+  }
+
+  // ---- Play track ----
+  // Bass: chord root, one octave down, with a rotating rhythm.
+  if (BASS_RHYTHMS[bar % BASS_RHYTHMS.length][s]) {
+    playTone(root - 12, t, stepDur * 1.6, "sawtooth", 0.13);
+  }
+  // Arpeggio over chord tones across two octaves; descends on odd bars.
+  const arp = [chord[0], chord[1], chord[2], chord[0] + 12,
+               chord[1] + 12, chord[2] + 12, chord[1] + 12, chord[2]];
+  let ai = s % arp.length;
+  if (bar % 2 === 1) ai = arp.length - 1 - ai;
+  playTone(arp[ai], t, stepDur * 1.0, "triangle", 0.05);
+
+  // Lead melody only in the back half of each 4-bar phrase (dynamics), with
+  // the two phrases alternating each 8-bar cycle.
+  if (bar % 4 >= 2) {
+    const phrase = Math.floor(bar / 8) % 2 === 0 ? LEAD_A : LEAD_B;
+    const off = phrase[s];
+    if (off !== null) playTone(root + 12 + off, t, stepDur * 2, "square", 0.045);
+  }
+
+  // Percussion groove.
+  if (s % 4 === 0) playKick(t);                 // four on the floor
+  if (s === 4 || s === 12) playSnare(t);        // backbeat
+  if (s % 2 === 1) playHat(t, s % 4 === 3 ? 0.04 : 0.022); // offbeat hats
+  if (bar % 8 === 7 && (s === 13 || s === 15)) playSnare(t); // end-of-cycle fill
+}
+
+function resetBall(dir) {
+  ball.x = W / 2 - BALL_SIZE / 2;
+  ball.y = H / 2 - BALL_SIZE / 2;
+  const angle = (Math.random() * 0.6 - 0.3); // small vertical angle
+  ball.vx = dir * BALL_SPEED * Math.cos(angle);
+  ball.vy = BALL_SPEED * Math.sin(angle);
+  ball.owner = null;   // nobody has hit this serve yet
+  ball.fire = false;   // clear any fireball effect from the last rally
+  ball.bonus = 1;      // clear any double-point effect
+  ball.curve = 0;      // clear any curveball spin
+  ball.trail.length = 0;
+}
+
+function resetGame() {
+  player.score = 0;
+  cpu.score = 0;
+  player.y = H / 2 - PADDLE_H / 2;
+  cpu.y = H / 2 - PADDLE_H / 2;
+  gameOver = false;
+  ship.active = false;
+  ship.timer = 90 + Math.floor(Math.random() * 120); // delay before first spawn
+  clearAbilities();
+  cpuThinkAt = 0;
+  particles = [];
+  powerups = [];
+  powerupTimer = 240 + Math.floor(Math.random() * 240); // first pickup delay
+  shake = 0;
+  flash = null;
+  shrinkUntil.player = 0;
+  shrinkUntil.cpu = 0;
+  cpu.h = PADDLE_H;
+  recomputeHeights(); // ensure full-size paddles on the start screen
+  resetBall(Math.random() < 0.5 ? -1 : 1);
+}
+
+function setHeight(p, h) {
+  // Resize a paddle while keeping it centered on its current position.
+  if (p.h === h) return;
+  const center = p.y + p.h / 2;
+  p.h = h;
+  p.y = Math.max(0, Math.min(H - h, center - h / 2));
+}
+
+function recomputeHeights() {
+  // Single source of truth for paddle heights: base height, modified by each
+  // side's Grow ability and by Shrink pickups, then applied.
+  let pBase = activeAbility === "grow" ? PADDLE_H * 1.9 : PADDLE_H;
+  let cBase = cpuActiveAbility === "grow" ? PADDLE_H * 1.9 : PADDLE_H;
+  if (frame < shrinkUntil.player) pBase *= 0.5;
+  if (frame < shrinkUntil.cpu) cBase *= 0.5;
+  setHeight(player, pBase);
+  setHeight(cpu, cBase);
+}
+
+function clearAbilities() {
+  // Reset both sides' ability state (used when (re)starting a game).
+  activeAbility = null; abilityEndsAt = 0; abilityReadyAt = 0;
+  pendingSmash = false; pendingCurve = false;
+  cpuActiveAbility = null; cpuAbilityEndsAt = 0; cpuAbilityReadyAt = 0;
+  cpuPendingSmash = false; cpuPendingCurve = false;
+  frozenUntil.player = 0; frozenUntil.cpu = 0;
+  ballSpeedMul = 1;
+  recomputeHeights();
+}
+
+// Activate an ability for either side. Returns true if it fired.
+function activateAbility(side, id) {
+  const player_ = side === "player";
+  if (frame < (player_ ? abilityReadyAt : cpuAbilityReadyAt)) {
+    if (player_) sfx.wall();   // player feedback for "still on cooldown"
+    return false;
+  }
+  const a = ABILITIES.find((x) => x.id === id);
+  if (player_) abilityReadyAt = frame + a.cd; else cpuAbilityReadyAt = frame + a.cd;
+  const pad = player_ ? player : cpu;
+
+  // Armed-hit abilities: consumed on this side's next paddle hit.
+  if (a.id === "smash") {
+    if (player_) pendingSmash = true; else cpuPendingSmash = true;
+    sfx.ability(); return true;
+  }
+  if (a.id === "curve") {
+    if (player_) pendingCurve = true; else cpuPendingCurve = true;
+    sfx.ability(); return true;
+  }
+
+  // Instant abilities.
+  if (a.id === "blink") {
+    // Teleport to the ball (player) or its predicted intercept (CPU).
+    const ty = player_ ? ball.y + BALL_SIZE / 2 : predictBallY();
+    pad.y = Math.max(0, Math.min(H - pad.h, ty - pad.h / 2));
+    burst(pad.x + PADDLE_W / 2, pad.y + pad.h / 2, a.color, 18, 6);
+    sfx.ability(); return true;
+  }
+  if (a.id === "freeze") {
+    frozenUntil[player_ ? "cpu" : "player"] = frame + 110; // freeze the foe ~1.8s
+    const foe = player_ ? cpu : player;
+    burst(foe.x + PADDLE_W / 2, foe.y + foe.h / 2, a.color, 16, 5);
+    sfx.ability(); return true;
+  }
+
+  // Timed abilities (grow, slow, shield, haste): replace any previous one.
+  if (player_) { activeAbility = a.id; abilityEndsAt = frame + a.dur; }
+  else { cpuActiveAbility = a.id; cpuAbilityEndsAt = frame + a.dur; }
+  recomputeHeights();
+  sfx.ability();
+  return true;
+}
+
+// The CPU decides whether to spend an ability, gated by reaction time and the
+// difficulty's aggressiveness. It defends incoming heat and arms counter-smashes.
+function updateCpuAbilities() {
+  if (frame < cpuAbilityReadyAt || frame < cpuThinkAt) return;
+  cpuThinkAt = frame + 25 + Math.floor(Math.random() * 35); // ponder ~0.4–1s
+  const aggression = DIFFICULTIES[difficulty].use || 0.4;
+  if (Math.random() > aggression) return;
+
+  const incoming = ball.vx > 0;                 // ball heading toward the CPU
+  const speed = Math.hypot(ball.vx, ball.vy);
+  const dist = cpu.x - (ball.x + BALL_SIZE);     // horizontal gap to the CPU
+  const pool = [];                               // weighted list of candidates
+
+  if (incoming) {
+    // How far the CPU must travel to reach the predicted intercept.
+    const reach = Math.abs(predictBallY() - (cpu.y + cpu.h / 2));
+    if (speed > BALL_SPEED * 1.7) pool.push("slow", "grow");      // tame heat
+    if (reach > cpu.h * 1.2) pool.push("blink", "haste");          // can't reach
+    if (dist < W * 0.4) pool.push("shield", "smash", "curve");     // close: wall/strike
+    else pool.push("grow", "curve", "haste");
+  } else {
+    // Ball heading to the player — lock them down or set up the next shot.
+    pool.push("freeze", "freeze", "grow");
+  }
+  if (pool.length) activateAbility("cpu", pool[Math.floor(Math.random() * pool.length)]);
+}
+
+function spawnShip() {
+  // Place it in the central horizontal band, random vertical position.
+  ship.active = true;
+  ship.x = W / 2 - SHIP_W / 2 + (Math.random() - 0.5) * 120;
+  ship.y = 60 + Math.random() * (H - 120 - SHIP_H);
+  ship.vy = (Math.random() < 0.5 ? -1 : 1) * (0.6 + Math.random() * 0.9);
+  ship.timer = 360 + Math.floor(Math.random() * 300); // stays ~6-11s
+}
+
+function updateShip() {
+  ship.bob += 0.15;
+  ship.timer--;
+  if (!ship.active) {
+    if (ship.timer <= 0) spawnShip();
+    return;
+  }
+  // Drift vertically, bouncing within the playfield.
+  ship.y += ship.vy;
+  if (ship.y <= 40 || ship.y + SHIP_H >= H - 40) ship.vy *= -1;
+  if (ship.timer <= 0) {
+    ship.active = false;
+    ship.timer = 180 + Math.floor(Math.random() * 240); // gap before next one
+  }
+}
+
+function ballHitsShip() {
+  if (!ship.active) return;
+  // AABB overlap test between ball and ship.
+  if (ball.x + BALL_SIZE < ship.x || ball.x > ship.x + SHIP_W ||
+      ball.y + BALL_SIZE < ship.y || ball.y > ship.y + SHIP_H) return;
+
+  // Resolve along the axis of smallest penetration → realistic ricochet.
+  const bcx = ball.x + BALL_SIZE / 2, bcy = ball.y + BALL_SIZE / 2;
+  const scx = ship.x + SHIP_W / 2,    scy = ship.y + SHIP_H / 2;
+  const overlapX = (BALL_SIZE / 2 + SHIP_W / 2) - Math.abs(bcx - scx);
+  const overlapY = (BALL_SIZE / 2 + SHIP_H / 2) - Math.abs(bcy - scy);
+
+  if (overlapX < overlapY) {
+    ball.vx *= -1;
+    ball.x += bcx < scx ? -overlapX : overlapX; // push ball clear
+  } else {
+    ball.vy *= -1;
+    ball.y += bcy < scy ? -overlapY : overlapY;
+  }
+  burst(bcx, bcy, "#9fe7ff", 10, 4);
+  shake = Math.max(shake, 4);
+  sfx.ship();
+}
+
+// ---- Particles (sparks on hits, scores, ricochets) ----
+function burst(x, y, color, n = 10, spd = 4) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = spd * (0.3 + Math.random() * 0.7);
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * s,
+      vy: Math.sin(a) * s,
+      life: 1, color,
+      size: 1.5 + Math.random() * 2.5,
+    });
+  }
+}
+function updateParticles() {
+  for (const p of particles) {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vx *= 0.94;
+    p.vy *= 0.94;
+    p.life -= 0.035;
+  }
+  particles = particles.filter((p) => p.life > 0);
+}
+
+// ---- Floating power-ups ----
+function spawnPowerup() {
+  const type = POWERUPS[Math.floor(Math.random() * POWERUPS.length)];
+  powerups.push({
+    ...type,
+    x: W / 2 + (Math.random() - 0.5) * 220,
+    y: 80 + Math.random() * (H - 160),
+    bob: Math.random() * Math.PI * 2,
+  });
+}
+function updatePowerups() {
+  powerupTimer--;
+  if (powerupTimer <= 0 && powerups.length < 2) {
+    spawnPowerup();
+    powerupTimer = 360 + Math.floor(Math.random() * 360); // ~6–12s apart
+  }
+  const bcx = ball.x + BALL_SIZE / 2, bcy = ball.y + BALL_SIZE / 2;
+  for (const p of powerups) {
+    p.bob += 0.1;
+    const dx = bcx - p.x, dy = bcy - p.y;
+    if (dx * dx + dy * dy <= (POWERUP_R + BALL_SIZE / 2) ** 2) {
+      collectPowerup(p);
+      p.dead = true;
+    }
+  }
+  powerups = powerups.filter((p) => !p.dead);
+}
+function collectPowerup(p) {
+  // The "owner" is whoever last hit the ball; fall back to its travel direction.
+  const owner = ball.owner || (ball.vx > 0 ? "player" : "cpu");
+  const foe = owner === "player" ? "cpu" : "player";
+  if (p.id === "fire") {
+    ball.fire = true;
+    const speed = Math.min(Math.hypot(ball.vx, ball.vy) * 1.45, BALL_SPEED * 3);
+    const ang = Math.atan2(ball.vy, ball.vx);
+    ball.vx = Math.cos(ang) * speed;
+    ball.vy = Math.sin(ang) * speed;
+    shake = Math.max(shake, 7);
+  } else if (p.id === "double") {
+    ball.bonus = 2;
+  } else if (p.id === "shrink") {
+    shrinkUntil[foe] = frame + 360; // ~6s
+  }
+  flash = { text: p.name + "!", color: p.color, t: 70 };
+  burst(p.x, p.y, p.color, 22, 6);
+  sfx.ability();
+}
+
+// ---- Deep-space background (parallax stars, planets, nebulae) ----
+const STAR_TINTS = ["255,255,255", "180,200,255", "200,180,255", "255,228,200"];
+function initSpace() {
+  stars = [];
+  for (let i = 0; i < 100; i++) {
+    stars.push({
+      x: Math.random() * W,
+      y: Math.random() * H,
+      z: 0.3 + Math.random() * 1.7, // depth → speed, size & brightness
+      tw: Math.random() * Math.PI * 2,
+      tint: STAR_TINTS[Math.floor(Math.random() * STAR_TINTS.length)],
+    });
+  }
+  // Dim, distant planets (kept dark so the playfield stays readable).
+  planets = [
+    { x: 150, y: 110, r: 48, drift: 0.04, c1: "#4a3570", c2: "#160d2a", ring: false },
+    { x: 660, y: 380, r: 66, drift: 0.025, c1: "#1d4a5e", c2: "#0a1822", ring: true },
+  ];
+  // Soft coloured nebula clouds.
+  nebulas = [
+    { x: 230, y: 360, r: 240, color: "rgba(120,40,150,0.16)" },
+    { x: 600, y: 120, r: 280, color: "rgba(30,80,160,0.15)" },
+  ];
+}
+function updateSpace() {
+  for (const s of stars) {
+    s.x -= s.z * 0.4;
+    s.tw += 0.05;
+    if (s.x < 0) { s.x = W; s.y = Math.random() * H; }
+  }
+  for (const p of planets) {
+    p.x -= p.drift;
+    if (p.x + p.r < 0) p.x = W + p.r;
+  }
+  // Occasional shooting star streaking across the sky.
+  const ss = shootingStar;
+  if (ss.active) {
+    ss.x += ss.vx; ss.y += ss.vy; ss.timer--;
+    if (ss.timer <= 0 || ss.x > W + 40 || ss.y > H + 40) {
+      ss.active = false;
+      ss.timer = 240 + Math.floor(Math.random() * 360); // gap before next
+    }
+  } else if (--ss.timer <= 0) {
+    ss.active = true;
+    ss.x = Math.random() * W * 0.6;
+    ss.y = Math.random() * H * 0.4;
+    ss.vx = 6 + Math.random() * 4;
+    ss.vy = 2.5 + Math.random() * 2;
+    ss.timer = 60 + Math.floor(Math.random() * 60);     // visible lifetime
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  keys[e.key.toLowerCase()] = true;
+  // Stop arrow keys / space from scrolling the page.
+  if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
+  kickAudio(); // unlock audio + start the right track on first gesture
+
+  if (e.key === " ") {
+    if (scene === "title") {
+      scene = "play"; resetGame(); running = true; startMusic("play"); return;
+    }
+    if (gameOver) { resetGame(); running = true; startMusic("play"); return; }
+    running = !running;
+  }
+  if (e.key === "1") difficulty = "easy";
+  if (e.key === "2") difficulty = "medium";
+  if (e.key === "3") difficulty = "hard";
+  if (e.key === "4") difficulty = "pro";
+  if (e.key.toLowerCase() === "m") muted = !muted;
+  // Toggle Normal / Fast game speed.
+  if (!e.repeat && e.key.toLowerCase() === "f") {
+    speedMode = speedMode === "normal" ? "fast" : "normal";
+    gameSpeed = SPEED_MODES[speedMode].mul;
+  }
+  // Abilities: Q cycles the selection, E activates it (ignore key-repeat).
+  if (!e.repeat && e.key.toLowerCase() === "q") {
+    abilityIdx = (abilityIdx + 1) % ABILITIES.length;
+  }
+  if (!e.repeat && e.key.toLowerCase() === "e") {
+    ensureAudio();
+    activateAbility("player", ABILITIES[abilityIdx].id);
+  }
+});
+document.addEventListener("keyup", (e) => { keys[e.key.toLowerCase()] = false; });
+
+// Mouse / touch control for the left paddle (ignored while frozen)
+function moveToY(clientY) {
+  if (frame < frozenUntil.player) return;
+  const rect = canvas.getBoundingClientRect();
+  const y = (clientY - rect.top) * (H / rect.height);
+  player.y = Math.max(0, Math.min(H - player.h, y - player.h / 2));
+}
+canvas.addEventListener("mousemove", (e) => moveToY(e.clientY));
+canvas.addEventListener("touchmove", (e) => {
+  e.preventDefault();
+  if (e.touches[0]) moveToY(e.touches[0].clientY);
+}, { passive: false });
+// Any pointer press also unlocks/starts audio (autoplay policies need a gesture).
+document.addEventListener("pointerdown", kickAudio);
+
+function update() {
+  if (scene !== "play" || !running || gameOver) return;
+
+  frame++;
+  // Expire timed abilities whose duration has elapsed (both sides).
+  if (activeAbility && frame >= abilityEndsAt) activeAbility = null;
+  if (cpuActiveAbility && frame >= cpuAbilityEndsAt) cpuActiveAbility = null;
+  recomputeHeights(); // applies Grow ability + Shrink pickups each frame
+  // Slow-Mo is active while either side holds it.
+  ballSpeedMul = (activeAbility === "slow" || cpuActiveAbility === "slow") ? 0.5 : 1;
+  updateCpuAbilities(); // let the AI spend its abilities
+
+  // Player paddle (W/S or arrow keys) — unless frozen by a Freeze Ray.
+  if (frame >= frozenUntil.player) {
+    const paddleStep = PADDLE_SPEED * gameSpeed * (activeAbility === "haste" ? HASTE_MUL : 1);
+    if (keys["w"] || keys["arrowup"]) player.y -= paddleStep;
+    if (keys["s"] || keys["arrowdown"]) player.y += paddleStep;
+    player.y = Math.max(0, Math.min(H - player.h, player.y));
+  }
+
+  // CPU paddle — frozen paddles hold still.
+  if (frame >= frozenUntil.cpu) {
+  if (difficulty === "pro") {
+    updateProCPU();
+  } else {
+    // Imperfect, beatable AI.
+    // - Only "wakes up" and chases when the ball is heading toward it.
+    // - When idle it lazily drifts back toward center.
+    // - Aims at a noisy target refreshed on a timer (reaction lag), so it
+    //   overshoots, hesitates, and misjudges fast/angled shots.
+    const d = DIFFICULTIES[difficulty];
+    const cpuCenter = cpu.y + cpu.h / 2;
+    cpuRetargetIn--;
+    if (ball.vx > 0) {
+      if (cpuRetargetIn <= 0) {
+        cpuRetargetIn = d.reMin + Math.floor(Math.random() * (d.reMax - d.reMin));
+        const aimError = (Math.random() - 0.5) * PADDLE_H * d.error;
+        cpuTarget = ball.y + BALL_SIZE / 2 + aimError;
+      }
+    } else if (cpuRetargetIn <= 0) {
+      cpuRetargetIn = 20;
+      cpuTarget = H / 2 + (Math.random() - 0.5) * 60;
+    }
+    const diff = cpuTarget - cpuCenter;
+    const haste = cpuActiveAbility === "haste" ? HASTE_MUL : 1;
+    const maxStep = PADDLE_SPEED * d.speed * gameSpeed * haste;
+    if (Math.abs(diff) > 6) {
+      cpu.y += Math.max(-maxStep, Math.min(maxStep, diff));
+    }
+    cpu.y = Math.max(0, Math.min(H - cpu.h, cpu.y));
+  }
+  } // end freeze guard
+
+  // Trail: remember a few recent ball positions for the motion streak.
+  ball.trail.push({ x: ball.x + BALL_SIZE / 2, y: ball.y + BALL_SIZE / 2 });
+  if (ball.trail.length > 12) ball.trail.shift();
+
+  // Move ball. Slow-Mo and game-speed scale the displacement, not the stored
+  // velocity. prevX is kept for swept collision (so fast balls can't tunnel).
+  const prevX = ball.x;
+  const step = ballSpeedMul * gameSpeed;
+  // Curveball: bend the trajectory by accelerating vy, capped so it can't loop.
+  if (ball.curve) {
+    ball.vy += ball.curve * step;
+    const cap = BALL_SPEED * 2;
+    ball.vy = Math.max(-cap, Math.min(cap, ball.vy));
+  }
+  ball.x += ball.vx * step;
+  ball.y += ball.vy * step;
+
+  // Top / bottom walls
+  if (ball.y <= 0) {
+    ball.y = 0; ball.vy *= -1; sfx.wall();
+    burst(ball.x + BALL_SIZE / 2, 2, "#888", 6, 3);
+  }
+  if (ball.y + BALL_SIZE >= H) {
+    ball.y = H - BALL_SIZE; ball.vy *= -1; sfx.wall();
+    burst(ball.x + BALL_SIZE / 2, H - 2, "#888", 6, 3);
+  }
+
+  // Spaceship obstacle
+  updateShip();
+  ballHitsShip();
+
+  // Floating power-ups, particles, decaying effects
+  updatePowerups();
+  updateParticles();
+  if (shake > 0) shake *= 0.88;
+  if (flash) { flash.t--; if (flash.t <= 0) flash = null; }
+
+  // Energy Shields: a wall in front of a goal repels the incoming ball.
+  // Swept against the shield's inner face so a fast ball can't skip past it.
+  const pShieldFace = SHIELD_X + 5;
+  if (activeAbility === "shield" && ball.vx < 0 &&
+      prevX >= pShieldFace && ball.x <= pShieldFace) {
+    ball.x = pShieldFace;
+    ball.vx *= -1;
+    sfx.shield();
+    burst(SHIELD_X, ball.y + BALL_SIZE / 2, "#E07CFC", 12, 4);
+  }
+  if (cpuActiveAbility === "shield" && ball.vx > 0 &&
+      prevX + BALL_SIZE <= SHIELD_X_R && ball.x + BALL_SIZE >= SHIELD_X_R) {
+    ball.x = SHIELD_X_R - BALL_SIZE;
+    ball.vx *= -1;
+    sfx.shield();
+    burst(SHIELD_X_R, ball.y + BALL_SIZE / 2, "#E07CFC", 12, 4);
+  }
+
+  // Paddle collisions (swept: detect the ball crossing the paddle face this
+  // frame, so even very fast / smashed balls can't pass through the paddle).
+  const pFace = player.x + PADDLE_W;     // player paddle's right face
+  if (ball.vx < 0 && prevX >= pFace && ball.x <= pFace &&
+      ball.y + BALL_SIZE >= player.y && ball.y <= player.y + player.h) {
+    ball.x = pFace;
+    bounce(player);
+  }
+  const cFace = cpu.x;                    // CPU paddle's left face
+  if (ball.vx > 0 && prevX + BALL_SIZE <= cFace && ball.x + BALL_SIZE >= cFace &&
+      ball.y + BALL_SIZE >= cpu.y && ball.y <= cpu.y + cpu.h) {
+    ball.x = cFace - BALL_SIZE;
+    bounce(cpu);
+  }
+
+  // Scoring
+  if (ball.x + BALL_SIZE < 0) score("cpu", 1);
+  if (ball.x > W) score("player", -1);
+}
+
+// Award a point (with any Double-ball bonus, if the scorer owned the ball).
+function score(side, serveDir) {
+  const pts = ball.bonus > 1 && ball.owner === side ? ball.bonus : 1;
+  if (side === "cpu") cpu.score += pts; else player.score += pts;
+  const gx = side === "cpu" ? 8 : W - 8;
+  burst(gx, ball.y + BALL_SIZE / 2, side === "cpu" ? "#fc7c7c" : "#7cfc8a", 26, 7);
+  shake = Math.max(shake, 10);
+  sfx.score();
+  afterPoint(serveDir);
+}
+
+// Predict the ball's center-y when it reaches the CPU's paddle, accounting
+// for top/bottom wall bounces (the analytic "fold" of a straight line).
+function predictBallY() {
+  if (ball.vx <= 0) return ball.y + BALL_SIZE / 2;
+  const dx = (cpu.x - BALL_SIZE) - ball.x;       // horizontal distance to intercept
+  const yEnd = ball.y + ball.vy * (dx / ball.vx); // unfolded landing (top-left y)
+  const range = H - BALL_SIZE, period = 2 * range;
+  let m = ((yEnd % period) + period) % period;    // position within one bounce period
+  const folded = m <= range ? m : period - m;     // reflect back into the playfield
+  return folded + BALL_SIZE / 2;
+}
+
+// Competitive opponent: reads the shot, places returns away from you, recovers.
+function updateProCPU() {
+  const center = cpu.y + cpu.h / 2;
+  const dir = Math.sign(ball.vx);
+
+  // The instant the ball turns toward the CPU: add a human reaction lag and a
+  // fresh read of the shot — usually accurate, occasionally a real misjudgment.
+  if (dir > 0 && cpuPrevBallDir <= 0) {
+    cpuReactAt = frame + 7 + Math.floor(Math.random() * 7); // ~0.1–0.25s lag
+    const blunder = Math.random() < 0.12;
+    cpuAimError = (Math.random() - 0.5) * PADDLE_H * (blunder ? 1.4 : 0.35);
+  }
+  cpuPrevBallDir = dir;
+
+  let target;
+  if (ball.vx > 0) {
+    if (frame < cpuReactAt) {
+      target = center;                  // hasn't reacted yet — hold position
+    } else {
+      // Aim the return to the side of the court AWAY from where you are now,
+      // by striking the ball off-centre on the paddle (wrong-footing you).
+      const playerCenter = player.y + player.h / 2;
+      const place = PADDLE_H * 0.32 * (playerCenter < H / 2 ? -1 : 1);
+      target = predictBallY() + place + cpuAimError;
+    }
+  } else {
+    target = H / 2;                      // ball going away → recover to centre
+  }
+
+  // Near-player reflexes when defending; relaxed glide when recovering.
+  const haste = cpuActiveAbility === "haste" ? HASTE_MUL : 1;
+  const maxStep = PADDLE_SPEED * (ball.vx > 0 ? 0.98 : 0.6) * gameSpeed * haste;
+  const diff = target - center;
+  if (Math.abs(diff) > 2) {
+    cpu.y += Math.max(-maxStep, Math.min(maxStep, diff));
+  }
+  cpu.y = Math.max(0, Math.min(H - cpu.h, cpu.y));
+}
+
+function bounce(paddle) {
+  // Reflect and add angle based on where it hit the paddle
+  const ph = paddle.h;
+  const isPlayer = paddle === player;
+  ball.owner = isPlayer ? "player" : "cpu"; // for power-up crediting
+  ball.curve = 0;                            // each clean hit cancels prior spin
+  const rel = (ball.y + BALL_SIZE / 2) - (paddle.y + ph / 2);
+  const norm = rel / (ph / 2); // -1 .. 1
+  let speed = Math.min(Math.hypot(ball.vx, ball.vy) * 1.04, BALL_SPEED * 2.2);
+  const dir = ball.vx < 0 ? 1 : -1;
+  const angle = norm * (Math.PI / 4); // up to 45 degrees
+
+  // Power Smash: an armed hit fires the ball back much faster (either side).
+  let smashed = false;
+  if (isPlayer && pendingSmash) {
+    pendingSmash = false; smashed = true; speed = BALL_SPEED * 2.6;
+  } else if (!isPlayer && cpuPendingSmash) {
+    cpuPendingSmash = false; smashed = true; speed = BALL_SPEED * 2.6;
+  }
+
+  // Curveball: an armed hit bends the outgoing shot. Direction follows the
+  // hit offset (or random on a centred hit) so it swerves unpredictably.
+  let curved = false;
+  if (isPlayer && pendingCurve) { pendingCurve = false; curved = true; armCurve(norm); }
+  else if (!isPlayer && cpuPendingCurve) { cpuPendingCurve = false; curved = true; armCurve(norm); }
+
+  ball.vx = dir * speed * Math.cos(angle);
+  ball.vy = speed * Math.sin(angle);
+  // Nudge out of paddle to avoid sticking
+  ball.x += dir * 2;
+
+  // Hit feedback: sparks off the paddle face, extra punch for a smash.
+  const hx = isPlayer ? player.x + PADDLE_W : cpu.x;
+  const sparkColor = curved ? "#FFA86B" : isPlayer ? "#7cfc8a" : "#fff";
+  burst(hx, ball.y + BALL_SIZE / 2, sparkColor, smashed ? 20 : 9, smashed ? 7 : 4);
+  if (smashed) shake = Math.max(shake, 9);
+  if (smashed) sfx.smash(); else if (curved) sfx.curve(); else sfx.paddle();
+}
+
+// Impart curveball spin. Direction follows the hit offset; a centred hit
+// picks a random side so the swerve isn't predictable.
+function armCurve(norm) {
+  const sign = Math.abs(norm) < 0.15 ? (Math.random() < 0.5 ? -1 : 1) : Math.sign(norm);
+  ball.curve = 0.09 * sign;
+}
+
+function afterPoint(dir) {
+  if (player.score >= WIN_SCORE || cpu.score >= WIN_SCORE) {
+    gameOver = true;
+    running = false;
+    sfx.win();
+  }
+  resetBall(dir);
+}
+
+// Deep-space backdrop: gradient void, nebulae, planets, stars, shooting stars.
+function drawSpace() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0b0a1f");
+  g.addColorStop(0.55, "#070512");
+  g.addColorStop(1, "#0c0618");
+  ctx.fillStyle = g;
+  ctx.fillRect(-24, -24, W + 48, H + 48);
+
+  // Nebula clouds (soft radial glows)
+  for (const n of nebulas) {
+    const rg = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, n.r);
+    rg.addColorStop(0, n.color);
+    rg.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = rg;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Planets
+  for (const p of planets) drawPlanet(p);
+
+  // Stars (twinkling, colour-tinted)
+  for (const s of stars) {
+    const b = (0.25 + 0.45 * (s.z / 2)) * (0.55 + 0.45 * Math.sin(s.tw));
+    ctx.fillStyle = `rgba(${s.tint},${b.toFixed(3)})`;
+    ctx.fillRect(s.x, s.y, s.z, s.z);
+  }
+
+  // Shooting star (bright head + fading tail)
+  const ss = shootingStar;
+  if (ss.active) {
+    const tx = ss.x - ss.vx * 4, ty = ss.y - ss.vy * 4;
+    const grad = ctx.createLinearGradient(tx, ty, ss.x, ss.y);
+    grad.addColorStop(0, "rgba(255,255,255,0)");
+    grad.addColorStop(1, "rgba(255,255,255,0.9)");
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(ss.x, ss.y);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+  }
+}
+
+function drawPlanet(p) {
+  if (p.ring) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(-0.4);
+    ctx.strokeStyle = "rgba(150,180,210,0.35)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, p.r * 1.7, p.r * 0.5, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  const rg = ctx.createRadialGradient(
+    p.x - p.r * 0.35, p.y - p.r * 0.35, p.r * 0.1, p.x, p.y, p.r
+  );
+  rg.addColorStop(0, p.c1);
+  rg.addColorStop(1, p.c2);
+  ctx.fillStyle = rg;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Paddle colour by current state (frozen > shrink > grow/haste > normal).
+function paddleColor(side, act) {
+  if (frame < frozenUntil[side]) return "#9FD8FF";   // icy = frozen
+  if (frame < shrinkUntil[side]) return "#ff5d7c";   // red  = shrunk
+  if (act === "grow") return "#7CFC8A";
+  if (act === "haste") return "#7CFCEB";
+  return "#fff";
+}
+
+function draw() {
+  // Clear with a margin so the screen-shake offset never leaves edge smear.
+  ctx.clearRect(-24, -24, W + 48, H + 48);
+  drawSpace(); // nebula gradient, planets, stars, shooting stars
+
+  // Title screen replaces the playfield until the player starts.
+  if (scene === "title") { drawTitle(); return; }
+
+  // Center dashed line
+  ctx.strokeStyle = "rgba(120,170,220,0.35)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([10, 14]);
+  ctx.beginPath();
+  ctx.moveTo(W / 2, 0);
+  ctx.lineTo(W / 2, H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Scores
+  ctx.fillStyle = "#fff";
+  ctx.font = "48px 'Courier New', monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(player.score, W / 2 - 60, 60);
+  ctx.fillText(cpu.score, W / 2 + 60, 60);
+
+  // Spaceship obstacle
+  if (ship.active) drawShip();
+
+  // Energy Shield walls (pulsing) — left = player, right = CPU
+  const shieldPulse = 0.4 + 0.4 * Math.sin(frame * 0.3);
+  if (activeAbility === "shield") {
+    ctx.fillStyle = `rgba(224, 124, 252, ${shieldPulse})`;
+    ctx.fillRect(SHIELD_X, 0, 5, H);
+  }
+  if (cpuActiveAbility === "shield") {
+    ctx.fillStyle = `rgba(224, 124, 252, ${shieldPulse})`;
+    ctx.fillRect(SHIELD_X_R, 0, 5, H);
+  }
+
+  // Floating power-ups (pulsing orb + glyph)
+  for (const p of powerups) {
+    const r = POWERUP_R + Math.sin(p.bob) * 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r + 6, 0, Math.PI * 2);
+    ctx.fillStyle = p.color + "33";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+    ctx.font = "16px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(p.glyph, p.x, p.y + 1);
+    ctx.textBaseline = "alphabetic";
+  }
+
+  // Ball trail (fading streak behind the ball)
+  for (let i = 0; i < ball.trail.length; i++) {
+    const t = ball.trail[i];
+    const a = (i / ball.trail.length) * 0.5;
+    const sz = BALL_SIZE * (0.4 + 0.6 * (i / ball.trail.length));
+    ctx.fillStyle = ball.fire
+      ? `rgba(255,${100 + i * 8},40,${a})`
+      : ball.curve ? `rgba(255,168,107,${a})`
+      : ball.bonus > 1 ? `rgba(255,211,77,${a})` : `rgba(255,255,255,${a})`;
+    ctx.fillRect(t.x - sz / 2, t.y - sz / 2, sz, sz);
+  }
+
+  // Paddles & ball (state may modify height/colour via abilities & effects)
+  ctx.fillStyle = paddleColor("player", activeAbility);
+  ctx.fillRect(player.x, player.y, PADDLE_W, player.h);
+  ctx.fillStyle = paddleColor("cpu", cpuActiveAbility);
+  ctx.fillRect(cpu.x, cpu.y, PADDLE_W, cpu.h);
+  ctx.fillStyle = ball.fire ? "#ff7b3d" : ball.curve ? "#FFA86B"
+    : ball.bonus > 1 ? "#ffd34d" : "#fff";
+  ctx.fillRect(ball.x, ball.y, BALL_SIZE, BALL_SIZE);
+
+  // Particles
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // Status line: difficulty + mute
+  ctx.fillStyle = "#666";
+  ctx.font = "13px 'Courier New', monospace";
+  ctx.fillText(
+    DIFFICULTIES[difficulty].label.toUpperCase() +
+      (speedMode === "fast" ? "  •  FAST" : "") +
+      (muted ? "  •  MUTED" : ""),
+    W / 2, H - 14
+  );
+
+  // Ability HUD (top-left): selected ability + ready / active / cooldown state.
+  const a = ABILITIES[abilityIdx];
+  let state, stateColor;
+  if ((a.id === "smash" && pendingSmash) || (a.id === "curve" && pendingCurve)) {
+    state = "ARMED"; stateColor = a.color;
+  } else if (activeAbility === a.id) {
+    state = "ACTIVE " + Math.ceil((abilityEndsAt - frame) / 60) + "s";
+    stateColor = a.color;
+  } else if (frame < abilityReadyAt) {
+    state = "CD " + Math.ceil((abilityReadyAt - frame) / 60) + "s";
+    stateColor = "#888";
+  } else { state = "READY"; stateColor = "#7CFC8A"; }
+
+  ctx.textAlign = "left";
+  ctx.font = "bold 14px 'Courier New', monospace";
+  ctx.fillStyle = a.color;
+  ctx.fillText("[Q] " + a.name, 14, 24);
+  ctx.fillStyle = stateColor;
+  ctx.font = "13px 'Courier New', monospace";
+  ctx.fillText("[E] " + state, 14, 42);
+
+  // CPU ability indicator (top-right): shows what the AI is currently doing.
+  ctx.textAlign = "right";
+  let cpuLabel = null, cpuColor = "#888";
+  if (cpuPendingSmash) { cpuLabel = "SMASH ARMED"; cpuColor = "#FC7C7C"; }
+  else if (cpuPendingCurve) { cpuLabel = "CURVE ARMED"; cpuColor = "#FFA86B"; }
+  else if (cpuActiveAbility) {
+    const ca = ABILITIES.find((x) => x.id === cpuActiveAbility);
+    cpuLabel = ca.name.toUpperCase();
+    cpuColor = ca.color;
+  }
+  if (cpuLabel) {
+    ctx.font = "bold 13px 'Courier New', monospace";
+    ctx.fillStyle = cpuColor;
+    ctx.fillText("CPU: " + cpuLabel, W - 14, 24);
+  }
+  ctx.textAlign = "center"; // restore for the rest of draw()
+
+  // Frozen alert (so it's clear why your paddle won't move)
+  if (frame < frozenUntil.player) {
+    ctx.fillStyle = "#9FD8FF";
+    ctx.font = "bold 22px 'Courier New', monospace";
+    ctx.fillText("❄ FROZEN ❄", W / 2, 140);
+  }
+
+  // Power-up pickup banner (fades out)
+  if (flash) {
+    ctx.globalAlpha = Math.min(1, flash.t / 30);
+    ctx.fillStyle = flash.color;
+    ctx.font = "bold 30px 'Courier New', monospace";
+    ctx.fillText(flash.text, W / 2, 110);
+    ctx.globalAlpha = 1;
+  }
+
+  // Messages
+  ctx.font = "24px 'Courier New', monospace";
+  if (gameOver) {
+    const won = player.score > cpu.score;
+    ctx.fillText(won ? "YOU WIN!" : "CPU WINS", W / 2, H / 2 - 20);
+    ctx.fillStyle = "#888";
+    ctx.font = "16px 'Courier New', monospace";
+    ctx.fillText("Press Space to play again", W / 2, H / 2 + 12);
+  } else if (!running) {
+    ctx.fillStyle = "#888";
+    ctx.fillText("Press Space to " + (player.score || cpu.score ? "resume" : "start"),
+                 W / 2, H / 2 + 80);
+  }
+}
+
+function drawShip() {
+  const cx = ship.x + SHIP_W / 2, cy = ship.y + SHIP_H / 2;
+  ctx.save();
+  ctx.translate(cx, cy);
+
+  // Saucer body
+  ctx.fillStyle = "#9fe7ff";
+  ctx.beginPath();
+  ctx.ellipse(0, 4, SHIP_W / 2, SHIP_H / 4, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dome
+  ctx.fillStyle = "#d7f6ff";
+  ctx.beginPath();
+  ctx.ellipse(0, -2, SHIP_W / 4, SHIP_H / 3, 0, Math.PI, 0);
+  ctx.fill();
+
+  // Cockpit
+  ctx.fillStyle = "#1b2a3a";
+  ctx.beginPath();
+  ctx.ellipse(0, -2, SHIP_W / 8, SHIP_H / 5, 0, Math.PI, 0);
+  ctx.fill();
+
+  // Pulsing engine lights
+  const glow = 0.5 + 0.5 * Math.sin(ship.bob);
+  ctx.fillStyle = `rgba(255, 180, 60, ${0.4 + glow * 0.6})`;
+  for (const dx of [-SHIP_W / 3, 0, SHIP_W / 3]) {
+    ctx.beginPath();
+    ctx.arc(dx, 9, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+function loop() {
+  tick++;
+  updateSpace();   // starfield / planets drift on the title screen and in play
+  scheduleMusic(); // keep the soundtrack flowing
+  if (masterMusic) masterMusic.gain.value = muted ? 0 : MUSIC_VOL; // M mutes music too
+  update();
+  ctx.save();
+  if (shake > 0.4) {
+    // Screen shake: jitter the whole frame by a decaying random offset.
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  }
+  draw();
+  ctx.restore();
+  requestAnimationFrame(loop);
+}
+
+// ---- Title screen ----
+function drawTitle() {
+  const cx = W / 2;
+
+  // Glowing PONG wordmark
+  ctx.textAlign = "center";
+  ctx.save();
+  ctx.shadowColor = "#7CC4FC";
+  ctx.shadowBlur = 24;
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 92px 'Courier New', monospace";
+  ctx.fillText("PONG", cx, 150);
+  ctx.restore();
+
+  ctx.fillStyle = "#7CC4FC";
+  ctx.font = "bold 20px 'Courier New', monospace";
+  ctx.fillText("◂ SPACE EDITION ▸", cx, 188);
+
+  // Difficulty selector (current one highlighted)
+  ctx.font = "16px 'Courier New', monospace";
+  const order = ["easy", "medium", "hard", "pro"];
+  const labels = ["1 Easy", "2 Medium", "3 Hard", "4 Versus"];
+  let dx = cx - 230;
+  for (let i = 0; i < order.length; i++) {
+    const sel = difficulty === order[i];
+    ctx.fillStyle = sel ? "#7CFC8A" : "#666";
+    const text = (sel ? "▸ " : "  ") + labels[i];
+    ctx.textAlign = "left";
+    ctx.fillText(text, dx, 240);
+    dx += 120;
+  }
+
+  // Speed selector (toggle with F)
+  ctx.textAlign = "center";
+  ctx.font = "16px 'Courier New', monospace";
+  ctx.fillStyle = "#FFD34D";
+  ctx.fillText(
+    "Speed [F]:  " + (speedMode === "fast" ? "▸ FAST" : "▸ NORMAL"),
+    cx, 268
+  );
+
+  // Controls
+  ctx.fillStyle = "#aaa";
+  ctx.font = "15px 'Courier New', monospace";
+  ctx.fillText("Move:  W / S   or   ↑ / ↓   (or mouse)", cx, 298);
+  ctx.fillText("Abilities:  Q cycle  •  E activate  •  M mute", cx, 322);
+  ctx.fillText("Collect power-ups  •  🛸 ricochets", cx, 346);
+  ctx.fillStyle = "#777";
+  ctx.font = "13px 'Courier New', monospace";
+  ctx.fillText("8 abilities: Grow · Slow-Mo · Smash · Shield · Blink · Haste · Freeze · Curve", cx, 364);
+  ctx.fillText("— the CPU uses them too —", cx, 384);
+
+  // Blinking prompt (uses tick so it animates even before the game starts)
+  if (Math.floor(tick / 30) % 2 === 0) {
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 22px 'Courier New', monospace";
+    ctx.fillText("PRESS  SPACE  TO  START", cx, 430);
+  }
+}
+
+initSpace();
+resetGame();
+scene = "title"; // resetGame doesn't touch the scene; show the title first
+loop();
+</script>
+</body>
+</html>
