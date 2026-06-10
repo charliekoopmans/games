@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trypophobia</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #07060a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-family: "Courier New", monospace;
+    color: #cdbfae;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    background: #0a0807;
+    border: 2px solid #2a211a;
+    border-radius: 8px;
+    box-shadow: 0 0 60px rgba(120, 40, 30, 0.25) inset, 0 0 30px rgba(0,0,0,0.8);
+    touch-action: none;
+    cursor: pointer;
+  }
+  #hint {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #6e6256;
+    text-align: center;
+    line-height: 1.7;
+    max-width: 620px;
+  }
+  #hint b { color: #b59a7a; }
+</style>
+</head>
+<body>
+  <canvas id="game" width="620" height="660"></canvas>
+  <div id="hint">
+    <b>Click</b> a hole to plug it &nbsp;•&nbsp; connect <b>4</b> in a row to win &nbsp;•&nbsp; <b>Space</b> / <b>R</b> restart<br>
+    <b>1</b> Easy &nbsp;<b>2</b> Medium &nbsp;<b>3</b> Hard CPU &nbsp;•&nbsp; <b>P</b> 2-player hot-seat &nbsp;•&nbsp; <b>I</b> Infested mode &nbsp;•&nbsp; <b>M</b> mute
+  </div>
+
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+// ---------------------------------------------------------------------------
+// TRYPOPHOBIA — a tabletop "connect 4-in-a-row" duel played on a honeycomb
+// cluster of holes. Players take turns plugging holes; first to line up four
+// of their own along any of the three hex axes wins. The dense field of holes
+// is, of course, the whole point. Optional "Infested" mode lets empty holes
+// fester permanently shut over time, tightening the cluster as you play.
+// ---------------------------------------------------------------------------
+
+// --- Board geometry (hexagon of hexes, axial coordinates) ------------------
+const R = 4;                 // board radius -> 61 holes
+const HEX = 33;              // hex spacing (px)
+const HOLE_R = 24;           // visible hole radius (px)
+const NEED = 4;              // holes in a row required to win
+const ORIGIN_X = W / 2;
+const ORIGIN_Y = H / 2 + 14;
+
+// Player identities. 0 = empty, 1 = player/green, 2 = rival/red, 3 = festered.
+const SPORE = 1, MITE = 2, FESTER = 3;
+const COLORS = {
+  [SPORE]: { core: "#9fe05a", rim: "#5e8a2e", glow: "rgba(159,224,90,0.55)", name: "SPORE" },
+  [MITE]:  { core: "#ff5d7c", rim: "#9c2f44", glow: "rgba(255,93,124,0.55)", name: "MITE"  },
+};
+
+// Build the hole list with axial coords + precomputed pixel centers.
+const holes = [];            // { q, r, x, y, owner, pop, hover }
+const holeAt = {};           // "q,r" -> hole
+function key(q, r) { return q + "," + r; }
+for (let q = -R; q <= R; q++) {
+  for (let r = -R; r <= R; r++) {
+    if (Math.abs(q + r) > R) continue;          // outside the hexagon
+    const x = ORIGIN_X + HEX * Math.sqrt(3) * (q + r / 2);
+    const y = ORIGIN_Y + HEX * 1.5 * r;
+    const hole = { q, r, x, y, owner: 0, pop: 0, hover: 0 };
+    holes.push(hole);
+    holeAt[key(q, r)] = hole;
+  }
+}
+
+// The three axes a winning line can run along (and their reverse is implicit).
+const DIRS = [ [1, 0], [0, 1], [1, -1] ];
+
+// --- Game state ------------------------------------------------------------
+let turn = SPORE;            // whose move it is
+let vsCpu = true;            // CPU plays MITE unless this is false (hot-seat)
+let difficulty = 2;         // 1 easy / 2 medium / 3 hard
+let infested = false;       // "Infested" mode: empty holes fester shut
+let movesSincePlace = 0;    // counter used to time festering
+let gameOver = false;
+let winner = 0;             // SPORE / MITE / 0=ongoing / -1=stalemate
+let winLine = [];           // holes forming the winning line (for the flourish)
+let cpuThinkAt = 0;         // frame the CPU commits its move
+let muted = false;
+let frame = 0;
+
+// --- Juice -----------------------------------------------------------------
+let particles = [];
+let shake = 0;
+let crawlers = [];          // ambient little bugs skittering over the board
+let banner = null;          // { text, color, t }
+
+// --- Audio (tiny WebAudio blips, like Pong's) ------------------------------
+let actx = null;
+function sfx(freq, dur, type = "sine", vol = 0.2) {
+  if (muted) return;
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) {}
+}
+function plopSound()  { sfx(160 + Math.random() * 40, 0.18, "sine", 0.25); sfx(90, 0.12, "triangle", 0.15); }
+function festerSound() { sfx(70, 0.4, "sawtooth", 0.18); }
+function winSound() {
+  [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => sfx(f, 0.25, "triangle", 0.22), i * 110));
+}
+function loseSound() { [392, 311, 247, 165].forEach((f, i) => setTimeout(() => sfx(f, 0.3, "sawtooth", 0.18), i * 130)); }
+
+// --- Helpers ---------------------------------------------------------------
+function emptyHoles() { return holes.filter(h => h.owner === 0); }
+
+// Does `owner` have NEED-in-a-row through any hole? Returns the line or null.
+function findWin(owner) {
+  for (const h of holes) {
+    if (h.owner !== owner) continue;
+    for (const [dq, dr] of DIRS) {
+      const line = [h];
+      let q = h.q + dq, r = h.r + dr;
+      while (holeAt[key(q, r)] && holeAt[key(q, r)].owner === owner) {
+        line.push(holeAt[key(q, r)]);
+        q += dq; r += dr;
+      }
+      if (line.length >= NEED) return line.slice(0, NEED);
+    }
+  }
+  return null;
+}
+
+// Count of `owner`'s holes adjacent-in-a-line, used to score CPU candidate moves.
+// Higher = the move builds toward / threatens a line.
+function lineScore(hole, owner) {
+  let score = 0;
+  for (const [dq, dr] of DIRS) {
+    let run = 1, openEnds = 0;
+    // walk both directions counting own holes and whether the ends are open
+    for (const sign of [1, -1]) {
+      let q = hole.q + dq * sign, r = hole.r + dr * sign, steps = 0;
+      while (steps < NEED) {
+        const n = holeAt[key(q, r)];
+        if (n && n.owner === owner) { run++; q += dq * sign; r += dr * sign; steps++; }
+        else { if (n && n.owner === 0) openEnds++; break; }
+      }
+    }
+    if (run >= NEED) score += 1000;                 // completes a line
+    else score += run * run + openEnds * 2;          // longer + open = better
+  }
+  return score;
+}
+
+// --- Placing a hole --------------------------------------------------------
+function place(hole, owner) {
+  hole.owner = owner;
+  hole.pop = 1;                                      // triggers the squish-in animation
+  spawnBurst(hole.x, hole.y, COLORS[owner].core, 14);
+  shake = Math.min(shake + 5, 14);
+  plopSound();
+
+  const line = findWin(owner);
+  if (line) { endGame(owner, line); return; }
+
+  movesSincePlace++;
+  if (infested) maybeFester();
+
+  if (emptyHoles().length === 0) { endGame(-1, []); return; }
+
+  turn = owner === SPORE ? MITE : SPORE;
+  if (vsCpu && turn === MITE) cpuThinkAt = frame + 32; // brief "thinking" beat
+}
+
+// In Infested mode, every couple of moves a random empty hole fests shut.
+// We avoid festering a hole that would instantly complete EITHER player's line
+// (keeps it tense, not arbitrary) and cap the spread so the board stays winnable.
+function maybeFester() {
+  const festeredCount = holes.filter(h => h.owner === FESTER).length;
+  if (festeredCount >= 8) return;
+  if (movesSincePlace % 3 !== 0) return;
+  const empties = emptyHoles();
+  if (empties.length <= NEED + 2) return;            // don't choke a nearly-full board
+  const pick = empties[Math.floor(Math.random() * empties.length)];
+  pick.owner = FESTER;
+  pick.pop = 1;
+  spawnBurst(pick.x, pick.y, "#5a3a2a", 10);
+  festerSound();
+  banner = { text: "IT SPREADS", color: "#a06a4a", t: 70 };
+}
+
+function endGame(who, line) {
+  gameOver = true;
+  winner = who;
+  winLine = line;
+  shake = 20;
+  if (who === SPORE) { banner = { text: "SPORES WIN", color: COLORS[SPORE].core, t: 240 }; winSound(); }
+  else if (who === MITE) {
+    banner = { text: vsCpu ? "INFESTED" : "MITES WIN", color: COLORS[MITE].core, t: 240 };
+    vsCpu ? loseSound() : winSound();
+  } else { banner = { text: "CLOGGED — DRAW", color: "#9a8a6a", t: 240 }; }
+  for (const h of line) spawnBurst(h.x, h.y, COLORS[who].core, 26);
+}
+
+// --- CPU -------------------------------------------------------------------
+function cpuMove() {
+  const empties = emptyHoles();
+  if (!empties.length) return;
+  let choice;
+
+  if (difficulty === 1) {
+    // Easy: mostly random, occasionally takes an obvious win.
+    choice = winningMove(MITE) || (Math.random() < 0.3 ? bestMove(MITE) : empties[Math.floor(Math.random() * empties.length)]);
+  } else if (difficulty === 2) {
+    // Medium: win if you can, block if you must, else build.
+    choice = winningMove(MITE) || winningMove(SPORE) || bestMove(MITE);
+  } else {
+    // Hard: win, block, otherwise pick the move best for ME while denying THEM.
+    choice = winningMove(MITE) || winningMove(SPORE) || bestMoveCombined();
+  }
+  place(choice, MITE);
+}
+
+function winningMove(owner) {
+  for (const h of emptyHoles()) {
+    h.owner = owner;
+    const win = findWin(owner);
+    h.owner = 0;
+    if (win) return h;
+  }
+  return null;
+}
+
+function bestMove(owner) {
+  let best = null, bestScore = -1;
+  for (const h of emptyHoles()) {
+    const s = lineScore(h, owner) + Math.random() * 3;
+    if (s > bestScore) { bestScore = s; best = h; }
+  }
+  return best;
+}
+
+// Hard CPU: value a hole for both attacking (my lines) and smothering (their lines).
+function bestMoveCombined() {
+  let best = null, bestScore = -1;
+  for (const h of emptyHoles()) {
+    const s = lineScore(h, MITE) * 1.1 + lineScore(h, SPORE) * 0.9 + Math.random() * 2;
+    if (s > bestScore) { bestScore = s; best = h; }
+  }
+  return best;
+}
+
+// --- Input -----------------------------------------------------------------
+function holeFromPointer(px, py) {
+  let nearest = null, nd = HOLE_R * HOLE_R;
+  for (const h of holes) {
+    const d = (h.x - px) ** 2 + (h.y - py) ** 2;
+    if (d < nd) { nd = d; nearest = h; }
+  }
+  return nearest;
+}
+
+function pointerPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+  const cy = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
+  return { x: cx * (W / rect.width), y: cy * (H / rect.height) };
+}
+
+function tryPlace(e) {
+  if (gameOver) { reset(); return; }
+  if (vsCpu && turn === MITE) return;                // not your turn
+  const { x, y } = pointerPos(e);
+  const h = holeFromPointer(x, y);
+  if (h && h.owner === 0) place(h, turn);
+}
+
+canvas.addEventListener("mousedown", tryPlace);
+canvas.addEventListener("touchstart", (e) => { e.preventDefault(); tryPlace(e); }, { passive: false });
+
+canvas.addEventListener("mousemove", (e) => {
+  const { x, y } = pointerPos(e);
+  const near = holeFromPointer(x, y);
+  for (const h of holes) h.hoverTarget = (h === near && h.owner === 0 && !(vsCpu && turn === MITE) && !gameOver) ? 1 : 0;
+});
+
+window.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  if (k === " " || k === "r") { e.preventDefault(); reset(); }
+  else if (k === "1") { difficulty = 1; vsCpu = true; flash("EASY CPU"); }
+  else if (k === "2") { difficulty = 2; vsCpu = true; flash("MEDIUM CPU"); }
+  else if (k === "3") { difficulty = 3; vsCpu = true; flash("HARD CPU"); }
+  else if (k === "p") { vsCpu = !vsCpu; flash(vsCpu ? "VS CPU" : "2-PLAYER"); }
+  else if (k === "i") { infested = !infested; flash(infested ? "INFESTED ON" : "INFESTED OFF"); }
+  else if (k === "m") { muted = !muted; flash(muted ? "MUTED" : "SOUND ON"); }
+});
+
+function flash(text) { banner = { text, color: "#b59a7a", t: 80 }; }
+
+function reset() {
+  for (const h of holes) { h.owner = 0; h.pop = 0; h.hover = 0; h.hoverTarget = 0; }
+  turn = SPORE; gameOver = false; winner = 0; winLine = [];
+  particles = []; shake = 0; movesSincePlace = 0; banner = null;
+  cpuThinkAt = 0;
+}
+
+// --- Particles & ambient bugs ----------------------------------------------
+function spawnBurst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 1 + Math.random() * 3.5;
+    particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1, color, size: 1 + Math.random() * 2.5 });
+  }
+}
+for (let i = 0; i < 5; i++) {
+  crawlers.push({ x: Math.random() * W, y: Math.random() * H, a: Math.random() * Math.PI * 2, sp: 0.2 + Math.random() * 0.3, t: 0 });
+}
+
+// --- Rendering -------------------------------------------------------------
+function drawHole(h) {
+  const r = HOLE_R;
+  if (h.owner === 0) {
+    // an empty pit: dark radial well that reads as a hole
+    const g = ctx.createRadialGradient(h.x - 3, h.y - 3, 2, h.x, h.y, r);
+    g.addColorStop(0, "#000");
+    g.addColorStop(0.6, "#16100c");
+    g.addColorStop(1, "#3a2c22");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(h.x, h.y, r, 0, Math.PI * 2); ctx.fill();
+    // hover glow ring for the current player
+    if (h.hover > 0.01) {
+      ctx.strokeStyle = COLORS[turn] ? COLORS[turn].glow : "rgba(255,255,255,0.4)";
+      ctx.lineWidth = 2 + h.hover * 2;
+      ctx.globalAlpha = h.hover;
+      ctx.beginPath(); ctx.arc(h.x, h.y, r - 2, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    return;
+  }
+
+  // pop animation: holes squish up to full size when plugged
+  const scale = 0.5 + 0.5 * (1 - h.pop);
+  const rr = r * (h.owner === FESTER ? 0.95 : scale);
+
+  if (h.owner === FESTER) {
+    // a festered hole: oozing dark scab with a crawling speckle
+    const g = ctx.createRadialGradient(h.x, h.y, 2, h.x, h.y, r);
+    g.addColorStop(0, "#3a241a");
+    g.addColorStop(1, "#180f0a");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(h.x, h.y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "rgba(90,60,40,0.7)";
+    for (let i = 0; i < 5; i++) {
+      const a = i * 1.7 + h.x;
+      ctx.beginPath();
+      ctx.arc(h.x + Math.cos(a) * r * 0.4, h.y + Math.sin(a) * r * 0.4, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    return;
+  }
+
+  const c = COLORS[h.owner];
+  // outer rim
+  ctx.fillStyle = c.rim;
+  ctx.beginPath(); ctx.arc(h.x, h.y, rr, 0, Math.PI * 2); ctx.fill();
+  // glossy bulb body
+  const pulse = 1 + Math.sin(frame * 0.06 + h.x) * 0.04;
+  const g = ctx.createRadialGradient(h.x - rr * 0.3, h.y - rr * 0.3, 1, h.x, h.y, rr);
+  g.addColorStop(0, "#ffffff");
+  g.addColorStop(0.25, c.core);
+  g.addColorStop(1, c.rim);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(h.x, h.y, rr * 0.78 * pulse, 0, Math.PI * 2); ctx.fill();
+  // a tiny dark "pupil" so the cluster feels like it's looking back
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.beginPath(); ctx.arc(h.x, h.y, rr * 0.18, 0, Math.PI * 2); ctx.fill();
+}
+
+function draw() {
+  frame++;
+  ctx.save();
+  if (shake > 0.2) {
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    shake *= 0.88;
+  } else shake = 0;
+
+  // fleshy background wash
+  const bg = ctx.createRadialGradient(W / 2, ORIGIN_Y, 60, W / 2, ORIGIN_Y, W * 0.75);
+  bg.addColorStop(0, "#1a1310");
+  bg.addColorStop(1, "#07060a");
+  ctx.fillStyle = bg;
+  ctx.fillRect(-30, -30, W + 60, H + 60);
+
+  // ambient crawlers skittering under the holes
+  for (const c of crawlers) {
+    c.t++;
+    if (c.t % 60 === 0) c.a += (Math.random() - 0.5) * 1.5;
+    c.x += Math.cos(c.a) * c.sp; c.y += Math.sin(c.a) * c.sp;
+    if (c.x < 0) c.x = W; if (c.x > W) c.x = 0;
+    if (c.y < 0) c.y = H; if (c.y > H) c.y = 0;
+    ctx.fillStyle = "rgba(60,45,35,0.5)";
+    ctx.beginPath(); ctx.arc(c.x, c.y, 1.8, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // animate hole transitions
+  for (const h of holes) {
+    if (h.pop > 0) h.pop = Math.max(0, h.pop - 0.06);
+    const target = h.hoverTarget || 0;
+    h.hover += (target - h.hover) * 0.2;
+  }
+
+  // draw all holes
+  for (const h of holes) drawHole(h);
+
+  // winning-line flourish: pulsing ring around the four holes
+  if (gameOver && winLine.length) {
+    const a = 0.4 + Math.sin(frame * 0.12) * 0.3;
+    ctx.strokeStyle = `rgba(255,255,255,${a})`;
+    ctx.lineWidth = 4;
+    for (const h of winLine) {
+      ctx.beginPath(); ctx.arc(h.x, h.y, HOLE_R + 4, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+
+  // particles
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.06; p.vx *= 0.97; p.life -= 0.025;
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  particles = particles.filter(p => p.life > 0);
+
+  ctx.restore();
+
+  drawHud();
+
+  // CPU acts after its little think delay
+  if (vsCpu && turn === MITE && !gameOver && frame >= cpuThinkAt && cpuThinkAt > 0) {
+    cpuThinkAt = 0;
+    cpuMove();
+  }
+
+  if (banner) { banner.t--; if (banner.t <= 0) banner = null; }
+
+  requestAnimationFrame(draw);
+}
+
+function drawHud() {
+  // Title
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#7a3a3a";
+  ctx.font = "bold 30px 'Courier New', monospace";
+  ctx.fillText("TRYPOPHOBIA", W / 2, 38);
+  ctx.fillStyle = "#5a4636";
+  ctx.font = "11px 'Courier New', monospace";
+  ctx.fillText("fear of clustered holes", W / 2, 54);
+
+  // Turn / status pills
+  ctx.font = "bold 15px 'Courier New', monospace";
+  const label = gameOver
+    ? "click / Space to play again"
+    : (vsCpu && turn === MITE ? "MITE (CPU) is plugging…" : `${COLORS[turn].name}'s turn — plug a hole`);
+  // current player's color dot
+  if (!gameOver) {
+    ctx.fillStyle = COLORS[turn].core;
+    ctx.beginPath(); ctx.arc(W / 2 - ctx.measureText(label).width / 2 - 14, H - 22, 6, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = gameOver ? "#9a8a6a" : COLORS[turn] ? COLORS[turn].core : "#fff";
+  ctx.fillText(label, W / 2 + (gameOver ? 0 : 8), H - 17);
+
+  // mode chips (top corners)
+  ctx.font = "11px 'Courier New', monospace";
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#6e5a44";
+  ctx.fillText(vsCpu ? ["", "EASY", "MEDIUM", "HARD"][difficulty] + " CPU" : "2-PLAYER", 12, 20);
+  ctx.textAlign = "right";
+  if (infested) { ctx.fillStyle = "#a06a4a"; ctx.fillText("⚠ INFESTED", W - 12, 20); }
+  if (muted) { ctx.fillStyle = "#6e5a44"; ctx.fillText("muted", W - 12, 36); }
+
+  // banner
+  if (banner) {
+    ctx.textAlign = "center";
+    ctx.globalAlpha = Math.min(1, banner.t / 30);
+    ctx.fillStyle = banner.color;
+    ctx.font = "bold 34px 'Courier New', monospace";
+    ctx.fillText(banner.text, W / 2, ORIGIN_Y - 6);
+    ctx.globalAlpha = 1;
+  }
+}
+
+reset();
+draw();
+</script>
+</body>
+</html>
