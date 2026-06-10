@@ -40,7 +40,7 @@
 <body>
   <canvas id="game" width="620" height="660"></canvas>
   <div id="hint">
-    <b>Click</b> a hole to plug it &nbsp;•&nbsp; connect <b>4</b> in a row to win &nbsp;•&nbsp; <b>Space</b> / <b>R</b> restart<br>
+    <b>Click</b> a hole to plug it &nbsp;•&nbsp; connect <b>5</b> in a row to win &nbsp;•&nbsp; <b>Space</b> / <b>R</b> restart<br>
     🎧 <span style="color:#8a4a4a">headphones on — sound begins when you click. you have been warned.</span><br>
     <b>1</b> Easy &nbsp;<b>2</b> Medium &nbsp;<b>3</b> Hard CPU &nbsp;•&nbsp; <b>P</b> 2-player hot-seat &nbsp;•&nbsp; <b>I</b> Infested mode &nbsp;•&nbsp; <b>M</b> mute
   </div>
@@ -62,7 +62,9 @@ const W = canvas.width, H = canvas.height;
 const R = 4;                 // board radius -> 61 holes
 const HEX = 33;              // hex spacing (px)
 const HOLE_R = 24;           // visible hole radius (px)
-const NEED = 4;              // holes in a row required to win
+const NEED = 5;              // holes in a row required to win (5, not 4: an open
+                            // 4-in-a-row board is a forced first-player win — you
+                            // could just draw a straight line. 5 is defensible.)
 const ORIGIN_X = W / 2;
 const ORIGIN_Y = H / 2 + 14;
 
@@ -90,6 +92,26 @@ for (let q = -R; q <= R; q++) {
 
 // The three axes a winning line can run along (and their reverse is implicit).
 const DIRS = [ [1, 0], [0, 1], [1, -1] ];
+// All six hex neighbours, used to find candidate moves near the action.
+const NEIGHBORS = [ [1, 0], [-1, 0], [0, 1], [0, -1], [1, -1], [-1, 1] ];
+
+// Every straight run of NEED holes (a "window") that could become a winning
+// line — precomputed once and reused by the AI's board evaluation.
+const WINDOWS = [];
+for (const h of holes) {
+  for (const [dq, dr] of DIRS) {
+    const w = [h];
+    let q = h.q + dq, r = h.r + dr, ok = true;
+    for (let i = 1; i < NEED; i++) {
+      const n = holeAt[key(q, r)];
+      if (!n) { ok = false; break; }
+      w.push(n); q += dq; r += dr;
+    }
+    if (ok) WINDOWS.push(w);
+  }
+}
+// Value of having N of your own holes in an otherwise-empty window.
+const WEIGHT = [0, 1, 12, 60, 1000];
 
 // --- Game state ------------------------------------------------------------
 let turn = SPORE;            // whose move it is
@@ -327,27 +349,6 @@ function findWin(owner) {
   return null;
 }
 
-// Count of `owner`'s holes adjacent-in-a-line, used to score CPU candidate moves.
-// Higher = the move builds toward / threatens a line.
-function lineScore(hole, owner) {
-  let score = 0;
-  for (const [dq, dr] of DIRS) {
-    let run = 1, openEnds = 0;
-    // walk both directions counting own holes and whether the ends are open
-    for (const sign of [1, -1]) {
-      let q = hole.q + dq * sign, r = hole.r + dr * sign, steps = 0;
-      while (steps < NEED) {
-        const n = holeAt[key(q, r)];
-        if (n && n.owner === owner) { run++; q += dq * sign; r += dr * sign; steps++; }
-        else { if (n && n.owner === 0) openEnds++; break; }
-      }
-    }
-    if (run >= NEED) score += 1000;                 // completes a line
-    else score += run * run + openEnds * 2;          // longer + open = better
-  }
-  return score;
-}
-
 // --- Placing a hole --------------------------------------------------------
 function place(hole, owner) {
   hole.owner = owner;
@@ -399,24 +400,26 @@ function endGame(who, line) {
 }
 
 // --- CPU -------------------------------------------------------------------
+// The AI takes any win, blocks any immediate loss, and otherwise searches ahead
+// with alpha-beta minimax over a windowed board score. Looking 4+ plies deep is
+// what lets it smother a developing open-ended three BEFORE it forks into an
+// unstoppable double threat — the old "just draw a straight line" exploit.
 function cpuMove() {
   const empties = emptyHoles();
   if (!empties.length) return;
   let choice;
-
   if (difficulty === 1) {
-    // Easy: mostly random, occasionally takes an obvious win.
-    choice = winningMove(MITE) || (Math.random() < 0.3 ? bestMove(MITE) : empties[Math.floor(Math.random() * empties.length)]);
-  } else if (difficulty === 2) {
-    // Medium: win if you can, block if you must, else build.
-    choice = winningMove(MITE) || winningMove(SPORE) || bestMove(MITE);
+    // Easy: grabs an obvious win or block, but otherwise plays loose.
+    choice = winningMove(MITE) || winningMove(SPORE) ||
+             (Math.random() < 0.5 ? randomCandidate() : searchMove(2));
   } else {
-    // Hard: win, block, otherwise pick the move best for ME while denying THEM.
-    choice = winningMove(MITE) || winningMove(SPORE) || bestMoveCombined();
+    // Medium searches 4 plies, Hard 5 — both deep enough to defuse a fork.
+    choice = winningMove(MITE) || winningMove(SPORE) || searchMove(difficulty === 2 ? 4 : 5);
   }
-  place(choice, MITE);
+  place(choice || empties[0], MITE);
 }
 
+// A move that immediately completes NEED-in-a-row for `owner`, or null.
 function winningMove(owner) {
   for (const h of emptyHoles()) {
     h.owner = owner;
@@ -427,21 +430,97 @@ function winningMove(owner) {
   return null;
 }
 
-function bestMove(owner) {
-  let best = null, bestScore = -1;
-  for (const h of emptyHoles()) {
-    const s = lineScore(h, owner) + Math.random() * 3;
-    if (s > bestScore) { bestScore = s; best = h; }
-  }
-  return best;
+function randomCandidate() {
+  const c = candidateMoves();
+  return c[Math.floor(Math.random() * c.length)];
 }
 
-// Hard CPU: value a hole for both attacking (my lines) and smothering (their lines).
-function bestMoveCombined() {
-  let best = null, bestScore = -1;
-  for (const h of emptyHoles()) {
-    const s = lineScore(h, MITE) * 1.1 + lineScore(h, SPORE) * 0.9 + Math.random() * 2;
-    if (s > bestScore) { bestScore = s; best = h; }
+// Empty holes worth considering: those touching an occupied hole (or the centre
+// on an empty board), ranked by a cheap centrality/adjacency score and capped.
+// Restricting and ordering moves keeps the alpha-beta search fast and focused.
+function candidateMoves() {
+  const set = new Set();
+  for (const h of holes) {
+    if (h.owner === 0) continue;
+    for (const [dq, dr] of NEIGHBORS) {
+      const n = holeAt[key(h.q + dq, h.r + dr)];
+      if (n && n.owner === 0) set.add(n);
+    }
+  }
+  const cands = [...set];
+  if (!cands.length) return [holeAt[key(0, 0)]];
+  for (const c of cands) c._ord = quickScore(c);
+  cands.sort((a, b) => b._ord - a._ord);
+  return cands.slice(0, 18);
+}
+
+function quickScore(c) {
+  let s = R - Math.max(Math.abs(c.q), Math.abs(c.r), Math.abs(c.q + c.r)); // central = better
+  for (const [dq, dr] of NEIGHBORS) {
+    const n = holeAt[key(c.q + dq, c.r + dr)];
+    if (n && n.owner !== 0) s += 2;                  // next to existing play = better
+  }
+  return s;
+}
+
+// Board score from MITE's point of view: sum every still-winnable window,
+// rewarding MITE's near-complete lines and (slightly more) punishing SPORE's.
+function evaluate() {
+  let score = 0;
+  for (const w of WINDOWS) {
+    let me = 0, op = 0;
+    for (const c of w) {
+      if (c.owner === MITE) me++;
+      else if (c.owner === SPORE) op++;
+      else if (c.owner === FESTER) { me = op = 9; break; } // festered = dead window
+    }
+    if (me && op) continue;                          // contested window — worthless
+    if (me === NEED) return 100000;
+    if (op === NEED) return -100000;
+    score += WEIGHT[me] - WEIGHT[op] * 1.08;         // slight defensive bias
+  }
+  return score;
+}
+
+function minimax(depth, alpha, beta, maximizing) {
+  const term = evaluate();
+  if (depth === 0 || term >= 100000 || term <= -100000) return term;
+  const moves = candidateMoves();
+  if (!moves.length) return term;
+  if (maximizing) {
+    let best = -Infinity;
+    for (const m of moves) {
+      m.owner = MITE;
+      const v = minimax(depth - 1, alpha, beta, false);
+      m.owner = 0;
+      if (v > best) best = v;
+      if (best > alpha) alpha = best;
+      if (alpha >= beta) break;
+    }
+    return best;
+  } else {
+    let best = Infinity;
+    for (const m of moves) {
+      m.owner = SPORE;
+      const v = minimax(depth - 1, alpha, beta, true);
+      m.owner = 0;
+      if (v < best) best = v;
+      if (best < beta) beta = best;
+      if (alpha >= beta) break;
+    }
+    return best;
+  }
+}
+
+function searchMove(depth) {
+  const moves = candidateMoves();
+  let best = moves[0], bestV = -Infinity;
+  for (const m of moves) {
+    m.owner = MITE;
+    let v = minimax(depth - 1, -Infinity, Infinity, false);
+    m.owner = 0;
+    v += Math.random() * 0.25;                       // tiny jitter to vary equal moves
+    if (v > bestV) { bestV = v; best = m; }
   }
   return best;
 }
